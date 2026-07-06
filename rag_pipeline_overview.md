@@ -6,8 +6,6 @@
 
 ### 1. Initialization and Setup
 
-The pipeline begins by loading necessary environment variables and initializing the core clients (e.g., LLMs, embedding models, vector stores, graph databases). Various RAG adapters are instantiated to standardize the interface across different systems:
-
 - **VectorRAG**: Traditional embedding-based retrieval.
 - **LightRAG**: A lightweight graph-based retrieval approach.
 - **HippoRAG**: An advanced graph RAG solution.

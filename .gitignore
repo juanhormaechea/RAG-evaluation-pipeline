@@ -11,3 +11,4 @@ wheels/
 .env*
 documents_to_index/*
 graphify-out/*
+templates/*

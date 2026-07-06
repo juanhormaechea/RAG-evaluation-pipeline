@@ -79,7 +79,7 @@ async def evaluate_retrieval(df: pd.DataFrame, openai_client, strategies: list[s
 
     
     
-    scorer_df.to_csv("./templates/CrossDoc_RAG_Scoring_Template_v2.csv")
+    scorer_df.to_csv("./templates/CrossDoc_RAG_Scoring_Template_v2.csv", index=False)
     metric_names = ["correctness", "nugget_recall", "faithful", "retrieval", "attribution"]
     average_df = pd.DataFrame(averages, index=metric_names).T
 

@@ -138,8 +138,8 @@ async def evaluate_retrieval(df: pd.DataFrame, retrieval_df: pd.DataFrame, opena
             scoring_summary_df.at[i, "faithfulness_rate"] = grouped_means.loc[q_type, faith_cols].mean() # type: ignore
 
 
-    scorer_df.to_csv("./templates/CrossDoc_RAG_Scoring_Template_v2.csv")
-    scoring_summary_df.to_csv("./templates/CrossDoc_RAG_Scoring_Summary.csv")
+    scorer_df.to_csv("./templates/CrossDoc_RAG_Scoring_Template_v2.csv", index=False)
+    scoring_summary_df.to_csv("./templates/CrossDoc_RAG_Scoring_Summary.csv", index=False)
 
 
     query_types = [

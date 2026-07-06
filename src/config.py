@@ -2,6 +2,7 @@ import os
 import shutil
 import logging
 import warnings
+from lightrag.utils import TokenTracker
 
 class Config:
     PROJECT_ID = "rag-testing-499811"
@@ -22,6 +23,8 @@ class Config:
     EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL")
     EMBEDDING_BINDING_API_KEY = os.getenv("EMBEDDING_BINDING_API_KEY")
     EMBEDDING_BINDING_HOST = os.getenv("EMBEDDING_BINDING_HOST")
+
+    TOKEN_TRACKER = None
 
     GRADE_PROMPT = (
     "You are a grader assessing relevance of a retrieved document to a user question. \n"
@@ -90,6 +93,8 @@ class Config:
 
     @classmethod
     def setup_directories(cls):
+        cls.TOKEN_TRACKER = TokenTracker()
+        
         if os.path.exists(cls.WORKING_DIR):
             shutil.rmtree(cls.WORKING_DIR)
         os.makedirs(cls.WORKING_DIR, exist_ok=True)
