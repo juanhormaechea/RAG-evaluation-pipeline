@@ -10,3 +10,4 @@ wheels/
 .venv
 .env*
 documents_to_index/*
+graphify-out/*
