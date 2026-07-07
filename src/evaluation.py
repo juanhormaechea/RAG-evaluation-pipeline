@@ -27,7 +27,7 @@ def add_eval_dataset(df: pd.DataFrame, strategies: list[str]) -> None:
 
 
 
-async def evaluate_retrieval(df: pd.DataFrame, retrieval_df: pd.DataFrame, openai_client, strategies: list[str]) -> pd.DataFrame:
+def _initialize_dataframes(strategies: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
     scorer_df = pd.read_csv("./templates/CrossDoc_RAG_Scoring_Template_v2.csv")
     scoring_summary_df = pd.read_csv("./templates/CrossDoc_RAG_Scoring_Summary.csv")
 
@@ -45,8 +45,25 @@ async def evaluate_retrieval(df: pd.DataFrame, retrieval_df: pd.DataFrame, opena
             col_name = f"{prefix}_{measure}"
             if col_name not in scorer_df.columns:
                 scorer_df[col_name] = pd.Series(dtype="float64")
+    return scorer_df, scoring_summary_df
 
 
+async def _run_llm_evaluations(
+    df: pd.DataFrame,
+    retrieval_df: pd.DataFrame,
+    openai_client,
+    strategies: list[str],
+    scorer_df: pd.DataFrame,
+    is_aggregated: bool
+) -> tuple[list[Any], list[tuple[str, int, str]]]:
+    PREFIX_MAP = {
+        "vector_rag": "vector",
+        "lightrag": "lightrag",
+        "hipporag": "hipporag",
+        "spanner_graph": "graph",
+        "agentic_rag": "agentic"
+    }
+    
     sem = asyncio.Semaphore(10)
 
     @retry(wait=wait_exponential(min=4, max=60), stop=stop_after_attempt(10))
@@ -60,9 +77,6 @@ async def evaluate_retrieval(df: pd.DataFrame, retrieval_df: pd.DataFrame, opena
                 ],
                 text_format=JudgeGradingScheme
             )
-
-
-    is_aggregated = "retrieval_time" in retrieval_df.index
 
     tasks = []
     task_metadata = []  
@@ -80,18 +94,39 @@ async def evaluate_retrieval(df: pd.DataFrame, retrieval_df: pd.DataFrame, opena
             tasks.append(safe_score(prompt))
             task_metadata.append((strategy, i, strategy_dataset["query_type"])) # type: ignore
 
-
     responses = await asyncio.gather(*tasks)
+    return responses, task_metadata
 
 
+def _parse_and_store_metrics(
+    scorer_df: pd.DataFrame,
+    responses: list[Any],
+    task_metadata: list[tuple[str, int, str]]
+) -> pd.DataFrame:
+    PREFIX_MAP = {
+        "vector_rag": "vector",
+        "lightrag": "lightrag",
+        "hipporag": "hipporag",
+        "spanner_graph": "graph",
+        "agentic_rag": "agentic"
+    }
     for res, (strategy, i, query_type) in zip(responses, task_metadata):
         output = res.output_parsed.model_dump()
         prefix = PREFIX_MAP[strategy]
         
         for metric in ["correctness", "nugget_recall", "faithful", "retrieval", "attribution"]:
             scorer_df.at[i, f"{prefix}_{metric}"] = output.get(metric)
+    return scorer_df
 
 
+def _calculate_final_scores(scorer_df: pd.DataFrame, strategies: list[str]) -> pd.DataFrame:
+    PREFIX_MAP = {
+        "vector_rag": "vector",
+        "lightrag": "lightrag",
+        "hipporag": "hipporag",
+        "spanner_graph": "graph",
+        "agentic_rag": "agentic"
+    }
     for strategy in strategies:
         prefix = PREFIX_MAP[strategy]
         scorer_df[f"{prefix}_final_score"] = 0.0
@@ -108,11 +143,12 @@ async def evaluate_retrieval(df: pd.DataFrame, retrieval_df: pd.DataFrame, opena
                 unanswerable=(q_type == "unanswerable")
             )
             scorer_df.at[i, f"{prefix}_final_score"] = final_score
+    return scorer_df
 
 
+def _aggregate_summary(scorer_df: pd.DataFrame, scoring_summary_df: pd.DataFrame) -> pd.DataFrame:
     grouped_means = scorer_df.groupby("query_type").mean(numeric_only=True)
 
- 
     for i in range(scoring_summary_df.shape[0]):
         system = scoring_summary_df.at[i, "system"]
         q_type = scoring_summary_df.at[i, "query_type"]
@@ -136,12 +172,11 @@ async def evaluate_retrieval(df: pd.DataFrame, retrieval_df: pd.DataFrame, opena
             scoring_summary_df.at[i, "avg_score"] = grouped_means.loc[q_type, score_cols].mean() # type: ignore
             scoring_summary_df.at[i, "avg_latency_ms"] = grouped_means.loc[q_type, lat_cols].mean() # type: ignore
             scoring_summary_df.at[i, "faithfulness_rate"] = grouped_means.loc[q_type, faith_cols].mean() # type: ignore
+    return scoring_summary_df
 
 
-    scorer_df.to_csv("./templates/CrossDoc_RAG_Scoring_Template_v2.csv", index=False)
-    scoring_summary_df.to_csv("./templates/CrossDoc_RAG_Scoring_Summary.csv", index=False)
-
-
+def _generate_visualizations(scorer_df: pd.DataFrame, scoring_summary_df: pd.DataFrame) -> None:
+    grouped_means = scorer_df.groupby("query_type").mean(numeric_only=True)
     query_types = [
         "cross_doc_synthesis", "consistency_check", "multi_doc_entity", 
         "cross_doc_multi_hop", "global_thematic", "factoid_single_doc", 
@@ -185,6 +220,22 @@ async def evaluate_retrieval(df: pd.DataFrame, retrieval_df: pd.DataFrame, opena
     plt.show()
 
 
+async def evaluate_retrieval(df: pd.DataFrame, retrieval_df: pd.DataFrame, openai_client, strategies: list[str]) -> pd.DataFrame:
+    scorer_df, scoring_summary_df = _initialize_dataframes(strategies)
+    is_aggregated = "retrieval_time" in retrieval_df.index
+
+    responses, task_metadata = await _run_llm_evaluations(
+        df, retrieval_df, openai_client, strategies, scorer_df, is_aggregated
+    )
+
+    scorer_df = _parse_and_store_metrics(scorer_df, responses, task_metadata)
+    scorer_df = _calculate_final_scores(scorer_df, strategies)
+    scoring_summary_df = _aggregate_summary(scorer_df, scoring_summary_df)
+
+    scorer_df.to_csv("./templates/CrossDoc_RAG_Scoring_Template_v2.csv", index=False)
+    scoring_summary_df.to_csv("./templates/CrossDoc_RAG_Scoring_Summary.csv", index=False)
+
+    _generate_visualizations(scorer_df, scoring_summary_df)
     
     average_latency = {}
     for strategy in strategies:

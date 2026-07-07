@@ -3,6 +3,7 @@
         "Agentic",
         "hipporag",
         "lightrag",
+        "litellm",
         "qdrant",
         "vectorstores"
     ]

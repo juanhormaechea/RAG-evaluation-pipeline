@@ -5,7 +5,7 @@ import hashlib
 from typing import Literal
 from qdrant_client import models
 from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage, ToolMessage, AIMessage
+from langchain_core.messages import HumanMessage, ToolMessage, AIMessage, SystemMessage
 from langchain.tools import tool
 from langchain.chat_models import init_chat_model
 from langchain_community.graphs.graph_document import GraphDocument, Node, Relationship
@@ -13,7 +13,7 @@ from langgraph.graph import MessagesState, START, END, StateGraph
 from langgraph.prebuilt import ToolNode
 from tenacity import retry, wait_exponential, stop_after_attempt
 from lightrag import QueryParam
-from src.utils import extract_descriptions_lightrag, GradeDocuments, load_documents, calculate_total_cost, get_litellm_usage
+from src.utils import extract_descriptions_lightrag, GradeDocuments, load_documents, calculate_total_cost
 from src.config import Config
 from langchain_qdrant import QdrantVectorStore
 
@@ -24,7 +24,7 @@ class BaseRAGAdapter(abc.ABC):
         pass
 
     @abc.abstractmethod
-    async def retrieve(self, query: str) -> tuple[float, list[str]]:
+    async def retrieve(self, query: str) -> list[str]:
         pass
 
 class VectorRAGAdapter(BaseRAGAdapter):
@@ -54,9 +54,9 @@ class VectorRAGAdapter(BaseRAGAdapter):
         self.vector_store.add_texts(texts=documents)
 
     @retry(wait=wait_exponential(1, max=10), stop=stop_after_attempt(5))
-    async def retrieve(self, query: str) -> tuple[float, list[str]]:
+    async def retrieve(self, query: str) -> list[str]:
         context = await asyncio.to_thread(self._sync_retrieve, query)
-        return (0.0, context)
+        return context
 
     def _sync_retrieve(self, query: str) -> list[str]:
         search_result = self.vector_store.similarity_search(query, k=5)
@@ -70,7 +70,7 @@ class LightRAGAdapter(BaseRAGAdapter):
         await self.rag.ainsert(documents)
 
     @retry(wait=wait_exponential(1, max=10), stop=stop_after_attempt(5))
-    async def retrieve(self, query: str) -> tuple[float, list[str]]:
+    async def retrieve(self, query: str) -> list[str]:
         param = QueryParam(
             mode="mix", 
             only_need_context=False, 
@@ -83,9 +83,9 @@ class LightRAGAdapter(BaseRAGAdapter):
         )
         context = await self.rag.aquery(query=query, param=param)
         clean_context = extract_descriptions_lightrag(str(context)) # type: ignore
-        cost = calculate_total_cost(Config.TOKEN_TRACKER.get_usage()) # type: ignore
-        Config.TOKEN_TRACKER.reset() # type: ignore
-        return (cost, clean_context)
+        # cost = calculate_total_cost(Config.TOKEN_TRACKER.get_usage()) # type: ignore
+        # Config.TOKEN_TRACKER.reset() # type: ignore
+        return clean_context
 
 
 class HippoRAGAdapter(BaseRAGAdapter):
@@ -96,17 +96,17 @@ class HippoRAGAdapter(BaseRAGAdapter):
         await asyncio.to_thread(self.hipporag.index, docs=documents)
 
     @retry(wait=wait_exponential(1, max=10), stop=stop_after_attempt(5))
-    async def retrieve(self, query: str) -> tuple[float, list[str]]:
+    async def retrieve(self, query: str) -> list[str]:
         if not self.hipporag.fact_embedding_store.embeddings:
-            return (0.0, [])
+            return []
         
-        spend_before = get_litellm_usage()
+        # spend_before = get_litellm_usage()
         results = await asyncio.to_thread(self.hipporag.retrieve, queries=[query])
-        spend_after = get_litellm_usage()
+        # spend_after = get_litellm_usage()
         context = results[0].docs[:5]
-        cost = spend_after - spend_before
+        # cost = spend_after - spend_before
 
-        return (cost, context)
+        return context
 
 class SpannerGraphRAGAdapter(BaseRAGAdapter):
     def __init__(self, graph_store, embedding_service, llm_transformer, graph_name):
@@ -259,7 +259,7 @@ class SpannerGraphRAGAdapter(BaseRAGAdapter):
             print("Successfully added graph documents to Spanner.")
 
     @retry(wait=wait_exponential(1, max=10), stop=stop_after_attempt(5))
-    async def retrieve(self, query: str) -> tuple[float, list[str]]:
+    async def retrieve(self, query: str) -> list[str]:
         query_embeddings = await asyncio.to_thread(self.embedding_service.embed_query, query)
         query_embeddings_str = ",".join(map(str, query_embeddings))
         
@@ -389,8 +389,9 @@ class AgenticRAGAdapter(BaseRAGAdapter):
     async def index(self, documents: list[str]):
         pass
 
-    async def retrieve(self, query: str) -> tuple[float, list[str]]:
-        result = await self.graph.ainvoke({"messages": [HumanMessage(content=query)]})
+    async def retrieve(self, query: str) -> list[str]:
+        
+        result = await self.graph.ainvoke({"messages": [SystemMessage(content=Config.RAG_SYSTEM_PROMPT), HumanMessage(content=query)]})
 
         context_blocks = [str(message.content) for message in result["messages"] if isinstance(message, ToolMessage)]
 
@@ -441,7 +442,7 @@ class AgenticRAGAdapter(BaseRAGAdapter):
         # Stop condition: prevent infinite loops by limiting max retries
         num_retrievals = sum(1 for msg in state["messages"] if isinstance(msg, ToolMessage))
         
-        if response.binary_score == 'yes' or num_retrievals >= 3: # type: ignore
+        if response.binary_score == 'yes' or num_retrievals >= 5: # type: ignore
             return "generate_answer"
         else:
             return "rewrite_question"

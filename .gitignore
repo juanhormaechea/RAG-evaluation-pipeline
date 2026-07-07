@@ -15,3 +15,6 @@ templates/*
 data/*
 outputs/*
 lightrag.log
+graphify*
+graphify-out
+test.py

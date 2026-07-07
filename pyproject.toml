@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11, <3.13"
 dependencies = [
     "docling>=2.107.0",
+    "google>=3.0.0",
     "google-cloud-spanner>=3.68.0",
     "hipporag>=2.0.0a3",
     "ipykernel>=7.3.0",
@@ -20,6 +21,7 @@ dependencies = [
     "langchain-text-splitters>=0.3.0",
     "langgraph>=1.0.1",
     "lightrag-hku>=1.4.9.3",
+    "litellm>=1.91.0",
     "matplotlib>=3.11.0",
     "neo4j>=5.20.0",
     "nest-asyncio>=1.6.0",

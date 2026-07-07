@@ -1,5 +1,6 @@
 import os
 import json
+import requests
 from typing import Any
 from pptx import Presentation
 from pydantic import BaseModel, Field
@@ -53,7 +54,7 @@ async def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwar
         # api_key=Config.OPENAI_API_KEY,
         api_key=Config.LLM_BINDING_API_KEY,
         base_url=Config.LLM_BINDING_HOST,
-        token_tracker=Config.TOKEN_TRACKER,
+        # token_tracker=Config.TOKEN_TRACKER,
         **kwargs
     )
 
@@ -64,8 +65,8 @@ async def embedding_func(texts: list[str]):
         # api_key=Config.OPENAI_API_KEY
         model=Config.EMBEDDING_MODEL,
         api_key=Config.EMBEDDING_BINDING_API_KEY,
-        base_url=Config.EMBEDDING_BINDING_HOST,
-        token_tracker=Config.TOKEN_TRACKER
+        base_url=Config.EMBEDDING_BINDING_HOST
+        # token_tracker=Config.TOKEN_TRACKER
     )
 
 
@@ -181,7 +182,7 @@ def calculate_average_score(dataset_list: list[dict[str, Any]], query_type: str)
 
 
 def calculate_total_cost(usage_data: dict) -> float:
-    # gemini 2.5 flash pricing, change at discretion
+    # gemini 2.5 flash pricing, change at your discretion
     INPUT_PRICE_PER_MILLION = 0.3
     OUTPUT_PRICE_PER_MILLION = 2.5
 
@@ -189,3 +190,16 @@ def calculate_total_cost(usage_data: dict) -> float:
     completion_cost = (usage_data["completion_tokens"] / 1000000) * OUTPUT_PRICE_PER_MILLION
     
     return prompt_cost + completion_cost
+
+
+# def get_litellm_usage():
+#     response = requests.get(
+#         f"{Config.LLM_BINDING_HOST}/user/info",
+#         headers={"Authorization": f"Bearer {Config.LLM_BINDING_API_KEY}"}
+#     )
+
+#     if response.status_code == 200:
+#         info = response.json().get("info", {})
+#         return info.get("spend", 0.0)
+    
+#     return response.status_code
