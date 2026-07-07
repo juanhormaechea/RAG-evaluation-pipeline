@@ -9,11 +9,11 @@ wheels/
 # Virtual environments
 .venv
 .env*
-documents_to_index/*
-graphify-out/*
-templates/*
-data/*
-outputs/*
+documents_to_index
+graphify-out
+templates
+data
+outputs
 lightrag.log
 graphify*
 graphify-out

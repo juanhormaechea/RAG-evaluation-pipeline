@@ -362,7 +362,7 @@ class AgenticRAGAdapter(BaseRAGAdapter):
 
         workflow = StateGraph(MessagesState)
         workflow.add_node(self.generate_query_or_respond)
-        workflow.add_node("retrieve", ToolNode([self.retrieve_context]))
+        workflow.add_node("_retrieve", ToolNode([self.retrieve_context]))
         workflow.add_node(self.rewrite_question)
         workflow.add_node(self.generate_answer)
 
@@ -371,13 +371,13 @@ class AgenticRAGAdapter(BaseRAGAdapter):
             "generate_query_or_respond",
             self.route_on_tool_calls,
             {
-                "tools": "retrieve",
+                "tools": "_retrieve",
                 END:END
             }
         )
 
         workflow.add_conditional_edges(
-            "retrieve",
+            "_retrieve",
             self.grade_documents
         )
 
@@ -442,7 +442,7 @@ class AgenticRAGAdapter(BaseRAGAdapter):
         # Stop condition: prevent infinite loops by limiting max retries
         num_retrievals = sum(1 for msg in state["messages"] if isinstance(msg, ToolMessage))
         
-        if response.binary_score == 'yes' or num_retrievals >= 5: # type: ignore
+        if response.binary_score == "yes" or response.binary_score == "'yes'" or num_retrievals >= 5: # type: ignore
             return "generate_answer"
         else:
             return "rewrite_question"
