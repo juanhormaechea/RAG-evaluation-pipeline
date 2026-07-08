@@ -17,18 +17,6 @@ class GradeDocuments(BaseModel):
 
     binary_score: str = Field(description="Relevance Score: 'yes' if relevant, 'no' if not relevant")
 
-class JudgeReasoningGradingScheme(BaseModel):
-    
-    correctness: str = Field(description="One line justification of correctness score")
-
-    nugget_recall: str = Field(description="One line justification of nugget_recall score")
-
-    faithful: str = Field(description="One line justification of faithfulness score")
-
-    retrieval: str = Field(description="One line justification of retrieval score")
-
-    attribution: str = Field(description="One line justification of attribution score")
-
 
 class JudgeGradingScheme(BaseModel):
     """Retrieval output grading scheme"""
@@ -42,12 +30,12 @@ class JudgeGradingScheme(BaseModel):
 
     attribution: float = Field(description="Each sentence cites the supporting document (ALCE-style citation precision/recall)", ge=0.0, le=1.0)
 
-    reasoning: JudgeReasoningGradingScheme = Field(description="One line justification of score for each metric.")
+    
 
 
 async def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwargs) -> str:
     return await openai_complete_if_cache(
-        model=Config.LLM_MODEL, # type: ignore
+        model=Config.LLM_MODEL_BASE, # type: ignore
         prompt=prompt,
         system_prompt=system_prompt,
         history_messages=history_messages,
@@ -181,15 +169,15 @@ def calculate_average_score(dataset_list: list[dict[str, Any]], query_type: str)
     return (final_score_sum / len(dataset_list))
 
 
-def calculate_total_cost(usage_data: dict) -> float:
-    # gemini 2.5 flash pricing, change at your discretion
-    INPUT_PRICE_PER_MILLION = 0.3
-    OUTPUT_PRICE_PER_MILLION = 2.5
+# def calculate_total_cost(usage_data: dict) -> float:
+#     # gemini 2.5 flash pricing, change at your discretion
+#     INPUT_PRICE_PER_MILLION = 0.3
+#     OUTPUT_PRICE_PER_MILLION = 2.5
 
-    prompt_cost = (usage_data["prompt_tokens"] / 1000000) * INPUT_PRICE_PER_MILLION
-    completion_cost = (usage_data["completion_tokens"] / 1000000) * OUTPUT_PRICE_PER_MILLION
+#     prompt_cost = (usage_data["prompt_tokens"] / 1000000) * INPUT_PRICE_PER_MILLION
+#     completion_cost = (usage_data["completion_tokens"] / 1000000) * OUTPUT_PRICE_PER_MILLION
     
-    return prompt_cost + completion_cost
+#     return prompt_cost + completion_cost
 
 
 # def get_litellm_usage():

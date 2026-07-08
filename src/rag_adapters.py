@@ -13,7 +13,7 @@ from langgraph.graph import MessagesState, START, END, StateGraph
 from langgraph.prebuilt import ToolNode
 from tenacity import retry, wait_exponential, stop_after_attempt
 from lightrag import QueryParam
-from src.utils import extract_descriptions_lightrag, GradeDocuments, load_documents, calculate_total_cost
+from src.utils import extract_descriptions_lightrag, GradeDocuments, load_documents
 from src.config import Config
 from langchain_qdrant import QdrantVectorStore
 
@@ -348,7 +348,7 @@ class AgenticRAGAdapter(BaseRAGAdapter):
         self.responses_dict = {}
         self.response_model = init_chat_model(
             model_provider="openai",
-            model=Config.LLM_MODEL,
+            model=Config.LLM_MODEL_1,
             api_key=Config.LLM_BINDING_API_KEY,
             base_url=Config.LLM_BINDING_HOST
         )

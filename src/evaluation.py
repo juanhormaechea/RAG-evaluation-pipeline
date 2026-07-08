@@ -9,7 +9,7 @@ from tenacity import retry, wait_exponential, stop_after_attempt
 from ragas.metrics.collections import ContextPrecision, ContextUtilization, ContextRecall, ContextEntityRecall, NoiseSensitivity, AnswerRelevancy, Faithfulness
 from ragas.llms import llm_factory
 from src.config import Config
-from src.utils import JudgeGradingScheme, calculate_average_score, calculate_final_score
+from src.utils import JudgeGradingScheme, calculate_final_score
 
 def add_eval_dataset(df: pd.DataFrame, strategies: list[str]) -> None:
     for strategy in strategies:
@@ -51,6 +51,7 @@ def _initialize_dataframes(strategies: list[str]) -> tuple[pd.DataFrame, pd.Data
 async def _run_llm_evaluations(
     df: pd.DataFrame,
     retrieval_df: pd.DataFrame,
+    gemini_client,
     openai_client,
     strategies: list[str],
     scorer_df: pd.DataFrame,
@@ -67,10 +68,10 @@ async def _run_llm_evaluations(
     sem = asyncio.Semaphore(10)
 
     @retry(wait=wait_exponential(min=4, max=60), stop=stop_after_attempt(10))
-    async def safe_score(prompt):
+    async def safe_score(client, prompt: str, model: str):
         async with sem:
-            return await openai_client.responses.parse(
-                model=Config.LLM_MODEL,
+            return await client.responses.parse(
+                model=model,
                 input=[
                     {"role": "system", "content": Config.JUDGE_SYSTEM_PROMPT},
                     {"role": "user", "content": prompt}
@@ -78,7 +79,9 @@ async def _run_llm_evaluations(
                 text_format=JudgeGradingScheme
             )
 
-    tasks = []
+    tasks_model_1 = []
+    tasks_model_2 = []
+    tasks_model_3 = []
     task_metadata = []  
 
     for strategy in strategies:
@@ -91,18 +94,29 @@ async def _run_llm_evaluations(
             
             strategy_dataset = df.at[i, f"dataset_{strategy}"]
             prompt = Config.USER_PROMPT.format(**strategy_dataset) # type: ignore
-            tasks.append(safe_score(prompt))
+            tasks_model_1.append(safe_score(openai_client, prompt, Config.LLM_MODEL_1))
+            tasks_model_2.append(safe_score(gemini_client, prompt, Config.LLM_MODEL_2))
+            tasks_model_3.append(safe_score(gemini_client, prompt, Config.LLM_MODEL_3))
             task_metadata.append((strategy, i, strategy_dataset["query_type"])) # type: ignore
 
-    responses = await asyncio.gather(*tasks)
-    return responses, task_metadata
+
+
+    responses_model_1, responses_model_2, responses_model_3 = await asyncio.gather(
+        asyncio.gather(*tasks_model_1),
+        asyncio.gather(*tasks_model_2),
+        asyncio.gather(*tasks_model_3)
+    )
+
+
+    return [responses_model_1, responses_model_2, responses_model_3], task_metadata
 
 
 def _parse_and_store_metrics(
     scorer_df: pd.DataFrame,
-    responses: list[Any],
+    response_list: list[Any],
     task_metadata: list[tuple[str, int, str]]
 ) -> pd.DataFrame:
+    
     PREFIX_MAP = {
         "vector_rag": "vector",
         "lightrag": "lightrag",
@@ -110,12 +124,21 @@ def _parse_and_store_metrics(
         "spanner_graph": "graph",
         "agentic_rag": "agentic"
     }
-    for res, (strategy, i, query_type) in zip(responses, task_metadata):
-        output = res.output_parsed.model_dump()
+
+    metrics = ["correctness", "nugget_recall", "faithful", "retrieval", "attribution"]
+
+    df1 = pd.DataFrame([res.output_parsed.model_dump() for res in response_list[0]])
+    df2 = pd.DataFrame([res.output_parsed.model_dump() for res in response_list[1]])
+    df3 = pd.DataFrame([res.output_parsed.model_dump() for res in response_list[2]])
+
+    avg_df = (df1[metrics] + df2[metrics] + df3[metrics]) / 3.0
+
+    for idx, (strategy, i, query_type) in enumerate(task_metadata):
         prefix = PREFIX_MAP[strategy]
+        for metric in metrics:
+            scorer_df.at[i, f"{prefix}_{metric}"] = avg_df.at[idx, metric]
         
-        for metric in ["correctness", "nugget_recall", "faithful", "retrieval", "attribution"]:
-            scorer_df.at[i, f"{prefix}_{metric}"] = output.get(metric)
+
     return scorer_df
 
 
@@ -220,15 +243,15 @@ def _generate_visualizations(scorer_df: pd.DataFrame, scoring_summary_df: pd.Dat
     plt.show()
 
 
-async def evaluate_retrieval(df: pd.DataFrame, retrieval_df: pd.DataFrame, openai_client, strategies: list[str]) -> pd.DataFrame:
+async def evaluate_retrieval(df: pd.DataFrame, retrieval_df: pd.DataFrame, gemini_client, openai_client, strategies: list[str]) -> pd.DataFrame:
     scorer_df, scoring_summary_df = _initialize_dataframes(strategies)
     is_aggregated = "retrieval_time" in retrieval_df.index
 
-    responses, task_metadata = await _run_llm_evaluations(
-        df, retrieval_df, openai_client, strategies, scorer_df, is_aggregated
+    response_list, task_metadata = await _run_llm_evaluations(
+        df, retrieval_df, gemini_client, openai_client, strategies, scorer_df, is_aggregated
     )
 
-    scorer_df = _parse_and_store_metrics(scorer_df, responses, task_metadata)
+    scorer_df = _parse_and_store_metrics(scorer_df, response_list, task_metadata)
     scorer_df = _calculate_final_scores(scorer_df, strategies)
     scoring_summary_df = _aggregate_summary(scorer_df, scoring_summary_df)
 

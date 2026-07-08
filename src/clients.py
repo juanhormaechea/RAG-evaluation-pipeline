@@ -10,8 +10,9 @@ from src.config import Config
 @dataclass
 class AppClients:
     qdrant_client: QdrantClient
-    openai_client: OpenAI
+    gemini_client: OpenAI
     async_openai_client: AsyncOpenAI
+    async_gemini_client: AsyncOpenAI
     llm: ChatOpenAI
     embedding_service: OpenAIEmbeddings
     llm_transformer: LLMGraphTransformer
@@ -24,19 +25,20 @@ def get_clients() -> AppClients:
     import httpx
     
     qdrant_client = QdrantClient(path=Config.QDRANT_STORAGE_DIR)
-    openai_client = OpenAI(api_key=Config.LLM_BINDING_API_KEY, base_url=Config.LLM_BINDING_HOST)
+    gemini_client = OpenAI(api_key=Config.LLM_BINDING_API_KEY, base_url=Config.LLM_BINDING_HOST)
     
     # Use a robust async http client to prevent Connection Errors during heavy Ragas evaluation
     http_client = httpx.AsyncClient(
         limits=httpx.Limits(max_connections=500, max_keepalive_connections=100),
         timeout=httpx.Timeout(120.0, connect=60.0)
     )
-    async_openai_client = AsyncOpenAI(api_key=Config.LLM_BINDING_API_KEY, base_url=Config.LLM_BINDING_HOST, http_client=http_client)
+    async_gemini_client = AsyncOpenAI(api_key=Config.LLM_BINDING_API_KEY, base_url=Config.LLM_BINDING_HOST, http_client=http_client)
+    async_openai_client = AsyncOpenAI(api_key=Config.OPENAI_API_KEY, http_client=http_client)
     
     llm = ChatOpenAI(
         # model="gpt-4o-mini-2024-07-18",
         # api_key=Config.OPENAI_API_KEY # type: ignore
-        model=Config.LLM_MODEL, # type: ignore
+        model=Config.LLM_MODEL_BASE, # type: ignore
         api_key=Config.LLM_BINDING_API_KEY, # type: ignore
         base_url=Config.LLM_BINDING_HOST
     )
@@ -57,7 +59,7 @@ def get_clients() -> AppClients:
         allowed_relationships=["RELATED_TO", "USES", "PRODUCES", "AFFECTS", "PART_OF", "LOCATED_IN", "IMPLEMENTS", "ACHIEVES"]
     )
     
-    ragas_embeddings = RagasOpenAIEmbeddings(async_openai_client, model=Config.EMBEDDING_MODEL)# type: ignore
+    ragas_embeddings = RagasOpenAIEmbeddings(async_gemini_client, model=Config.EMBEDDING_MODEL)# type: ignore
     
     graph_store = SpannerGraphStore(
         instance_id=Config.INSTANCE_ID,
@@ -67,8 +69,9 @@ def get_clients() -> AppClients:
     
     return AppClients(
         qdrant_client=qdrant_client,
-        openai_client=openai_client,
+        gemini_client=gemini_client,
         async_openai_client=async_openai_client,
+        async_gemini_client=async_gemini_client,
         llm=llm,
         embedding_service=embedding_service,
         llm_transformer=llm_transformer,
