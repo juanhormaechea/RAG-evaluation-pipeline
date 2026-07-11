@@ -1,5 +1,6 @@
 import abc
 import json
+import uuid
 import asyncio
 import hashlib
 from typing import Literal
@@ -13,23 +14,24 @@ from langgraph.graph import MessagesState, START, END, StateGraph
 from langgraph.prebuilt import ToolNode
 from tenacity import retry, wait_exponential, stop_after_attempt
 from lightrag import QueryParam
-from src.utils import extract_descriptions_lightrag, GradeDocuments, load_documents
+from src.utils import extract_descriptions_lightrag, GradeDocuments, RewrittenQuestion, load_documents, normalize_text, dedup_preserve_order, embed_query_with_cost, embed_texts_with_cost, calculate_total_cost, message_cost, UsageTrackingCallback
 from src.config import Config
 from langchain_qdrant import QdrantVectorStore
 
 
 class BaseRAGAdapter(abc.ABC):
     @abc.abstractmethod
-    async def index(self, documents: list[str]):
+    async def index(self, documents: list[str]) -> float:
         pass
 
     @abc.abstractmethod
-    async def retrieve(self, query: str) -> list[str]:
+    async def retrieve(self, query: str) -> tuple[list[str], float]:
         pass
 
 class VectorRAGAdapter(BaseRAGAdapter):
-    def __init__(self, qdrant_client, embedding_service):
+    def __init__(self, qdrant_client, embedding_service, gemini_client):
         self.client = qdrant_client
+        self.gemini_client = gemini_client
         if not self.client.collection_exists(collection_name="vector_storage"):
             self.client.create_collection(
                 collection_name="vector_storage",
@@ -41,51 +43,73 @@ class VectorRAGAdapter(BaseRAGAdapter):
             embedding=embedding_service
         )
 
-    async def index(self, documents: list[str]): # type: ignore
-        await asyncio.to_thread(self._sync_index, documents)
-
-    def _sync_index(self, documents: list[str]):
+    async def index(self, documents: list[str]) -> float: # type: ignore
+        cost = await asyncio.to_thread(self._sync_index, documents)
+        return cost
+    
+    def _sync_index(self, documents: list[str]) -> float:
         # Clear existing points or recreate collection
         self.client.delete_collection(collection_name="vector_storage")
         self.client.create_collection(
             collection_name="vector_storage",
             vectors_config=models.VectorParams(size=768, distance=models.Distance.COSINE)
         )
-        self.vector_store.add_texts(texts=documents)
+        # Collapse duplicate chunks before embedding, and assign deterministic
+        # content-hash IDs so identical text can never become two distinct points.
+        documents = dedup_preserve_order(documents)
+        ids = [str(uuid.uuid5(uuid.NAMESPACE_URL, normalize_text(t))) for t in documents]
+        # Embed through the litellm gateway (same endpoint as the query path) and
+        # upsert precomputed vectors so stored and query vectors stay consistent.
+        vectors, cost = embed_texts_with_cost(self.gemini_client, Config.EMBEDDING_MODEL, documents) # type: ignore
+        points = [
+            models.PointStruct(id=i, vector=v, payload={"page_content": t, "metadata": {}})
+            for i, t, v in zip(ids, documents, vectors)
+        ]
+        self.client.upsert(collection_name="vector_storage", points=points)
+
+        return cost
 
     @retry(wait=wait_exponential(1, max=10), stop=stop_after_attempt(5))
-    async def retrieve(self, query: str) -> list[str]:
+    async def retrieve(self, query: str) -> tuple[list[str], float]:
         context = await asyncio.to_thread(self._sync_retrieve, query)
         return context
 
-    def _sync_retrieve(self, query: str) -> list[str]:
-        search_result = self.vector_store.similarity_search(query, k=5)
-        return [doc.page_content for doc in search_result]
+    def _sync_retrieve(self, query: str) -> tuple[list[str], float]:
+        # Embed the query through the gateway to capture cost, then search by the
+        # precomputed vector. Over-fetch, then trim to 5 distinct chunks so residual
+        # duplicate points can't fill the result set.
+        vector, cost = embed_query_with_cost(self.gemini_client, Config.EMBEDDING_MODEL, query) # type: ignore
+        search_result = self.vector_store.similarity_search_by_vector(vector, k=20)
+        return dedup_preserve_order([doc.page_content for doc in search_result])[:5], cost
 
 class LightRAGAdapter(BaseRAGAdapter):
     def __init__(self, rag_instance):
         self.rag = rag_instance
 
     async def index(self, documents: list[str]):
+         # type: ignore
         await self.rag.ainsert(documents)
+        cost = calculate_total_cost(Config.TOKEN_TRACKER.get_usage()) # type: ignore
+        Config.TOKEN_TRACKER.reset() # type: ignore
+        return cost
 
     @retry(wait=wait_exponential(1, max=10), stop=stop_after_attempt(5))
-    async def retrieve(self, query: str) -> list[str]:
+    async def retrieve(self, query: str) -> tuple[list[str], float]:
         param = QueryParam(
-            mode="mix", 
-            only_need_context=False, 
-            enable_rerank=True, 
-            top_k=3,
-            chunk_top_k=3,
+            mode="mix",
+            only_need_context=False,
+            enable_rerank=True,
+            top_k=5,
+            chunk_top_k=5,
             max_entity_tokens=1000,
             max_relation_tokens=1000,
             max_total_tokens=3000
         )
         context = await self.rag.aquery(query=query, param=param)
         clean_context = extract_descriptions_lightrag(str(context)) # type: ignore
-        # cost = calculate_total_cost(Config.TOKEN_TRACKER.get_usage()) # type: ignore
-        # Config.TOKEN_TRACKER.reset() # type: ignore
-        return clean_context
+        cost = calculate_total_cost(Config.TOKEN_TRACKER.get_usage()) # type: ignore
+        Config.TOKEN_TRACKER.reset() # type: ignore
+        return clean_context, cost
 
 
 class HippoRAGAdapter(BaseRAGAdapter):
@@ -94,33 +118,36 @@ class HippoRAGAdapter(BaseRAGAdapter):
 
     async def index(self, documents: list[str]):
         await asyncio.to_thread(self.hipporag.index, docs=documents)
+        return 0.0
 
     @retry(wait=wait_exponential(1, max=10), stop=stop_after_attempt(5))
-    async def retrieve(self, query: str) -> list[str]:
+    async def retrieve(self, query: str) -> tuple[list[str], float]:
         if not self.hipporag.fact_embedding_store.embeddings:
-            return []
-        
+            return [], 0.0
+
         # spend_before = get_litellm_usage()
         results = await asyncio.to_thread(self.hipporag.retrieve, queries=[query])
         # spend_after = get_litellm_usage()
         context = results[0].docs[:5]
         # cost = spend_after - spend_before
 
-        return context
+        return context, 0.0
 
 class SpannerGraphRAGAdapter(BaseRAGAdapter):
-    def __init__(self, graph_store, embedding_service, llm_transformer, graph_name):
+    def __init__(self, graph_store, embedding_service, llm_transformer, graph_name, gemini_client):
         self.graph_store = graph_store
         self.embedding_service = embedding_service
         self.llm_transformer = llm_transformer
         self.graph_name = graph_name
+        self.gemini_client = gemini_client
 
     @retry(wait=wait_exponential(min=4, max=30), stop=stop_after_attempt(15))
-    async def _safe_extract_graph(self, doc: Document):
-        res = await self.llm_transformer.aconvert_to_graph_documents([doc])
+    async def _safe_extract_graph(self, doc: Document, config=None):
+        # config carries the UsageTrackingCallback so extraction LLM cost is captured.
+        res = await self.llm_transformer.aconvert_to_graph_documents([doc], config=config)
         return res[0]
 
-    async def index(self, documents: list[str]):
+    async def index(self, documents: list[str]) -> float:
         print("Cleaning up graph store before indexing...")
         await asyncio.to_thread(self.graph_store.cleanup)
         
@@ -129,15 +156,20 @@ class SpannerGraphRAGAdapter(BaseRAGAdapter):
         
         print(f"Starting Spanner graph extraction for {total_docs} documents...")
         
+        # Accumulates token usage from every extraction LLM call (all docs, all
+        # retries) via config callback; converted to cost with base-model pricing.
+        usage_cb = UsageTrackingCallback()
+        extract_config = {"callbacks": [usage_cb]}
+
         # Concurrency practice: Semaphore to control concurrency levels
         # and gather tasks to execute them concurrently.
         sem = asyncio.Semaphore(5)
-        
+
         async def extract_with_semaphore(idx, doc):
             async with sem:
                 try:
                     print(f"Extracting graph for document {idx+1}/{total_docs}...")
-                    graph_doc = await self._safe_extract_graph(doc)
+                    graph_doc = await self._safe_extract_graph(doc, extract_config)
                     print(f"Successfully extracted graph for document {idx+1}.")
                     return doc.page_content, graph_doc
                 except Exception as e:
@@ -212,10 +244,14 @@ class SpannerGraphRAGAdapter(BaseRAGAdapter):
                     
             graph_document.nodes.append(chunk_node)
 
+        embed_cost = 0.0
         if node_references:
             try:
                 print(f"Embedding {len(texts_to_embed)} nodes and chunks...")
-                embeddings = await asyncio.to_thread(self.embedding_service.embed_documents, texts_to_embed)
+                # Embed through the gateway so node/chunk vectors match the query path.
+                embeddings, embed_cost = await asyncio.to_thread(
+                    embed_texts_with_cost, self.gemini_client, Config.EMBEDDING_MODEL, texts_to_embed # type: ignore
+                )
                 for node, embedding in zip(node_references, embeddings):
                     node.properties["embedding"] = embedding
                 print("Successfully embedded nodes.")
@@ -258,9 +294,13 @@ class SpannerGraphRAGAdapter(BaseRAGAdapter):
             await asyncio.to_thread(self.graph_store.add_graph_documents, graph_documents=[merged_doc])
             print("Successfully added graph documents to Spanner.")
 
+        # Total indexing cost = LLM graph extraction (all docs + retries) + node/chunk embeddings.
+        return usage_cb.cost() + embed_cost
     @retry(wait=wait_exponential(1, max=10), stop=stop_after_attempt(5))
-    async def retrieve(self, query: str) -> list[str]:
-        query_embeddings = await asyncio.to_thread(self.embedding_service.embed_query, query)
+    async def retrieve(self, query: str) -> tuple[list[str], float]:
+        query_embeddings, cost = await asyncio.to_thread(
+            embed_query_with_cost, self.gemini_client, Config.EMBEDDING_MODEL, query # type: ignore
+        )
         query_embeddings_str = ",".join(map(str, query_embeddings))
         
         gql_query = f"""
@@ -268,7 +308,7 @@ class SpannerGraphRAGAdapter(BaseRAGAdapter):
             MATCH (node)
             WHERE node.embedding IS NOT NULL
             ORDER BY COSINE_DISTANCE(node.embedding, ARRAY[{query_embeddings_str}])
-            LIMIT 3
+            LIMIT 5
             RETURN SAFE_TO_JSON(node) as node_json
         """
         
@@ -329,12 +369,14 @@ class SpannerGraphRAGAdapter(BaseRAGAdapter):
             for texts in nested_texts:
                 for text in texts:
                     chunk_texts.add(text)
-                
-        return list(chunk_texts)[:5]
+
+        return list(chunk_texts)[:5], cost
     
 class AgenticRAGAdapter(BaseRAGAdapter):
-    def __init__(self, qdrant_client, embedding_service):
+    def __init__(self, qdrant_client, embedding_service, gemini_client):
         self.qdrant_client = qdrant_client
+        self.gemini_client = gemini_client
+        self._query_costs = []
         if not self.qdrant_client.collection_exists(collection_name="vector_storage"):
             self.qdrant_client.create_collection(
                 collection_name="vector_storage",
@@ -348,7 +390,7 @@ class AgenticRAGAdapter(BaseRAGAdapter):
         self.responses_dict = {}
         self.response_model = init_chat_model(
             model_provider="openai",
-            model=Config.LLM_MODEL_1,
+            model=Config.LLM_MODEL_BASE,
             api_key=Config.LLM_BINDING_API_KEY,
             base_url=Config.LLM_BINDING_HOST
         )
@@ -386,14 +428,24 @@ class AgenticRAGAdapter(BaseRAGAdapter):
 
         self.graph = workflow.compile()
     
-    async def index(self, documents: list[str]):
-        pass
+    async def index(self, documents: list[str]) -> float:
+        return 0.0
 
-    async def retrieve(self, query: str) -> list[str]:
-        
+    async def retrieve(self, query: str) -> tuple[list[str], float]:
+        # Reset per-query embedding cost accumulator before the graph runs; each
+        # retrieval round appends its cost in _sync_retrieve_context.
+        self._query_costs = []
+
         result = await self.graph.ainvoke({"messages": [SystemMessage(content=Config.RAG_SYSTEM_PROMPT), HumanMessage(content=query)]})
 
-        context_blocks = [str(message.content) for message in result["messages"] if isinstance(message, ToolMessage)]
+        # Split each tool message back into its chunks (joined with "\n\n" in
+        # _sync_retrieve_context) and dedup across all retrieval rounds so
+        # partially-overlapping rounds don't pile up duplicates.
+        raw_chunks = []
+        for message in result["messages"]:
+            if isinstance(message, ToolMessage):
+                raw_chunks.extend(str(message.content).split("\n\n"))
+        context_blocks = dedup_preserve_order(raw_chunks)
 
         final_answer = ""
 
@@ -401,9 +453,9 @@ class AgenticRAGAdapter(BaseRAGAdapter):
             if isinstance(message, AIMessage) and message.content:
                 final_answer = str(message.content)
                 break
-        
+
         self.responses_dict[query] = final_answer
-        return context_blocks
+        return context_blocks, sum(self._query_costs)
 
 
     def get_response(self, query: str) -> str:
@@ -411,8 +463,13 @@ class AgenticRAGAdapter(BaseRAGAdapter):
     
 
     def _sync_retrieve_context(self, query: str) -> str:
-        search_result = self.vector_store.similarity_search(query, k=5)
-        retrieved_context = [doc.page_content for doc in search_result]
+        # Embed the query through the gateway (capturing cost), then search by the
+        # precomputed vector. Over-fetch, then trim to 5 distinct chunks (shared
+        # "vector_storage" collection, so residual duplicate points are possible).
+        vector, cost = embed_query_with_cost(self.gemini_client, Config.EMBEDDING_MODEL, query) # type: ignore
+        self._query_costs.append(cost)
+        search_result = self.vector_store.similarity_search_by_vector(vector, k=20)
+        retrieved_context = dedup_preserve_order([doc.page_content for doc in search_result])[:5]
         return "\n\n".join(retrieved_context)
 
     @retry(wait=wait_exponential(min=4, max=60), stop=stop_after_attempt(10))
@@ -421,6 +478,7 @@ class AgenticRAGAdapter(BaseRAGAdapter):
         the question, it will decide to retrieve using the retriever tool, or simply respond to the user.
         """
         response = await self.response_model.bind_tools([self.retrieve_context]).ainvoke(state["messages"])
+        self._query_costs.append(message_cost(response))
         return {"messages": [response]}
 
     @retry(wait=wait_exponential(min=4, max=60), stop=stop_after_attempt(10))
@@ -437,8 +495,12 @@ class AgenticRAGAdapter(BaseRAGAdapter):
         context = "\n\n".join(context_blocks[::-1]) 
      
         prompt = Config.GRADE_PROMPT.format(context=context, question=question)
-        response = await self.response_model.with_structured_output(GradeDocuments).ainvoke([{"role": "user", "content": prompt}])
-        
+        result = await self.response_model.with_structured_output(GradeDocuments, include_raw=True).ainvoke([{"role": "user", "content": prompt}])
+        # Capture cost before touching result["parsed"]: a None parse would raise
+        # and trigger a tenacity re-run, so appending first avoids double-counting.
+        self._query_costs.append(message_cost(result["raw"])) # type: ignore
+        response = result["parsed"] # type: ignore
+
         # Stop condition: prevent infinite loops by limiting max retries
         num_retrievals = sum(1 for msg in state["messages"] if isinstance(msg, ToolMessage))
         
@@ -449,13 +511,27 @@ class AgenticRAGAdapter(BaseRAGAdapter):
 
     @retry(wait=wait_exponential(min=4, max=60), stop=stop_after_attempt(10))
     async def rewrite_question(self, state: MessagesState):
-        """rewrite the original user question"""
+        """Rewrite the latest question using the context judged not relevant"""
 
+        # [-1] is the most recent question: the original on round 1, otherwise the
+        # previous rewrite — so refinement compounds instead of restarting.
         question = [msg for msg in state["messages"] if isinstance(msg,
         HumanMessage)][-1].content
-        prompt = Config.REWRITE_PROMPT.format(question=question)
-        response = await self.response_model.ainvoke([{"role": "user", "content": prompt}])
-        return {"messages": [HumanMessage(content=response.content)]}
+        context_blocks = []
+        for msg in reversed(state["messages"]):
+            if not hasattr(msg, "tool_call_id"):
+                break
+            context_blocks.append(str(msg.content))
+
+        context = "\n\n".join(context_blocks[::-1])
+        prompt = Config.REWRITE_PROMPT.format(question=question, context=context)
+        result = await self.response_model.with_structured_output(RewrittenQuestion, include_raw=True).ainvoke([{"role": "user", "content": prompt}])
+        # Capture cost before touching result["parsed"]: a None parse would raise
+        # and trigger a tenacity re-run, so appending first avoids double-counting.
+        self._query_costs.append(message_cost(result["raw"])) # type: ignore
+        response = result["parsed"] # type: ignore
+        return {"messages": [HumanMessage(content=response.rewritten_question)]}
+
 
     @retry(wait=wait_exponential(min=4, max=60), stop=stop_after_attempt(10))
     async def generate_answer(self, state: MessagesState):
@@ -471,6 +547,7 @@ class AgenticRAGAdapter(BaseRAGAdapter):
         context = "\n\n".join(context_blocks[::-1])
         prompt = Config.GENERATE_PROMPT.format(question=question, context=context)
         response = await self.response_model.ainvoke([{"role": "user", "content": prompt}])
+        self._query_costs.append(message_cost(response))
 
         return {"messages": [response]}
 

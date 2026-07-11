@@ -9,6 +9,7 @@ wheels/
 # Virtual environments
 .venv
 .env*
+
 documents_to_index
 graphify-out
 templates
@@ -18,3 +19,5 @@ lightrag.log
 graphify*
 graphify-out
 test.py
+CLAUDE*
+.claude
