@@ -9,7 +9,8 @@ from tenacity import retry, wait_exponential, stop_after_attempt
 from ragas.metrics.collections import ContextPrecision, ContextUtilization, ContextRecall, ContextEntityRecall, NoiseSensitivity, AnswerRelevancy, Faithfulness
 from ragas.llms import llm_factory
 from src.config import Config
-from src.utils import JudgeGradingScheme, calculate_final_score
+from src.utils.schemas import JudgeGradingScheme
+from src.utils.scoring import calculate_final_score
 
 def add_eval_dataset(df: pd.DataFrame, strategies: list[str]) -> None:
     for strategy in strategies:

@@ -66,3 +66,20 @@ Based on the benchmark template, specific RAG methodologies are hypothesized to 
 | **Global Thematic**     | Broad queries asking for overarching themes or summaries of the entire corpus.                         | **Graph RAG**           | Graphs can abstract high-level communities and themes using community detection algorithms.                                      |
 | **Cross-Doc Multi-Hop** | Complex queries requiring the system to connect a chain of facts across different documents.           | **Agentic RAG**         | Agents can reason step-by-step, retrieving one fact to inform the search query for the next fact in the chain.                   |
 | **Cross-Doc Synthesis** | Queries requiring the amalgamation of disparate concepts from multiple sources into a cohesive answer. | **Graph / Agentic RAG** | Both methods excel here; graphs provide the structural links, while agents provide the reasoning to synthesize the final answer. |
+
+---
+
+## HippoRAG Cost Measurement
+
+HippoRAG (2.0.0a3) extracts per-call token metadata internally but never exposes it: `CacheOpenAI.infer` returns `(message, metadata, cache_hit)`, yet OpenIE accumulates the counts only in local scope and the DSPy rerank filter discards them, while `OpenAIEmbeddingModel.encode` drops the response `usage` entirely. With LiteLLM admin endpoints (`/key/info`, `/user/info`) unavailable, costs are measured caller-side via `instrument_hipporag()` (`src/utils.py`), which wraps — in place, no source modification — the two sync OpenAI clients every billable call flows through:
+
+- `llm_model.openai_client.chat.completions.create` → token counts priced at base-model rates via `calculate_total_cost` (covers OpenIE NER/triple extraction and DSPy fact reranking; wrapping `llm_model.infer` instead would miss reranking, since the filter binds that method at construction).
+- `embedding_model.client.embeddings.create` → rerouted through `with_raw_response` to read the gateway's `x-litellm-response-cost` header (covers chunk/entity/fact stores, synonymy edges, and query embeddings), matching how the other adapters price embeddings.
+
+`HippoRAGAdapter` resets the tracker before each `index`/`retrieve` and reports the accumulated cost, aligning HippoRAG with the cost accounting of the other systems.
+
+Known limitations:
+
+- Calls served from HippoRAG's SQLite LLM cache and its embedding cache never reach the wrapped clients and therefore report $0 — which is correct, as no API spend occurs on re-runs.
+- If the gateway omits the `x-litellm-response-cost` header, that embedding call contributes 0.0 rather than an estimate.
+- A retrieval attempt that fails and is retried only reports the final attempt's spend (same semantics as the other adapters).

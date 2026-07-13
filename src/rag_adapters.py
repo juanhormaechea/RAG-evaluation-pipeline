@@ -2,19 +2,21 @@ import abc
 import json
 import uuid
 import asyncio
-import hashlib
 from typing import Literal
 from qdrant_client import models
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, ToolMessage, AIMessage, SystemMessage
 from langchain.tools import tool
 from langchain.chat_models import init_chat_model
-from langchain_community.graphs.graph_document import GraphDocument, Node, Relationship
 from langgraph.graph import MessagesState, START, END, StateGraph
 from langgraph.prebuilt import ToolNode
 from tenacity import retry, wait_exponential, stop_after_attempt
 from lightrag import QueryParam
-from src.utils import extract_descriptions_lightrag, GradeDocuments, RewrittenQuestion, load_documents, normalize_text, dedup_preserve_order, embed_query_with_cost, embed_texts_with_cost, calculate_total_cost, message_cost, UsageTrackingCallback
+from src.utils.schemas import GradeDocuments, RewrittenQuestion
+from src.utils.documents import load_documents, normalize_text, dedup_preserve_order
+from src.utils.cost_tracking import embed_query_with_cost, embed_texts_with_cost, calculate_total_cost, message_cost, UsageTrackingCallback, instrument_hipporag
+from src.utils.graph_documents import build_global_node_types, sanitize_graph_documents, attach_chunk_nodes, merge_graph_documents
+from src.utils.lightrag_support import extract_descriptions_lightrag
 from src.config import Config
 from langchain_qdrant import QdrantVectorStore
 
@@ -115,23 +117,26 @@ class LightRAGAdapter(BaseRAGAdapter):
 class HippoRAGAdapter(BaseRAGAdapter):
     def __init__(self, hipporag_instance):
         self.hipporag = hipporag_instance
+        # Wraps HippoRAG's internal OpenAI clients so every billable call
+        # (OpenIE, rerank, embeddings) is captured; cache hits cost 0.
+        self.usage_tracker = instrument_hipporag(hipporag_instance)
 
     async def index(self, documents: list[str]):
+        self.usage_tracker.reset()
         await asyncio.to_thread(self.hipporag.index, docs=documents)
-        return 0.0
+        return self.usage_tracker.cost()
 
     @retry(wait=wait_exponential(1, max=10), stop=stop_after_attempt(5))
     async def retrieve(self, query: str) -> tuple[list[str], float]:
         if not self.hipporag.fact_embedding_store.embeddings:
             return [], 0.0
 
-        # spend_before = get_litellm_usage()
+        # Reset per attempt so a tenacity re-run doesn't double-count.
+        self.usage_tracker.reset()
         results = await asyncio.to_thread(self.hipporag.retrieve, queries=[query])
-        # spend_after = get_litellm_usage()
         context = results[0].docs[:5]
-        # cost = spend_after - spend_before
 
-        return context, 0.0
+        return context, self.usage_tracker.cost()
 
 class SpannerGraphRAGAdapter(BaseRAGAdapter):
     def __init__(self, graph_store, embedding_service, llm_transformer, graph_name, gemini_client):
@@ -180,69 +185,13 @@ class SpannerGraphRAGAdapter(BaseRAGAdapter):
         results = await asyncio.gather(*tasks)
         
         graph_documents_with_chunks = [(text, graph_doc) for text, graph_doc in results if graph_doc is not None]
-            
-        # Ensure consistent types for each node ID across all documents
-        global_node_types = {}
-        for chunk_text, doc in graph_documents_with_chunks:
-            for node in doc.nodes:
-                if not getattr(node, "type", None) or str(node.type).strip().lower() in ["null", "none", ""]:
-                    node.type = "Unknown"
-                if node.id not in global_node_types:
-                    global_node_types[node.id] = node.type
-            for rel in doc.relationships:
-                for target_node in [rel.source, rel.target]:
-                    if not getattr(target_node, "type", None) or str(target_node.type).strip().lower() in ["null", "none", ""]:
-                        target_node.type = "Unknown"
-                    if target_node.id not in global_node_types:
-                        global_node_types[target_node.id] = target_node.type
 
-        valid_graph_documents = []
-        for chunk_text, doc in graph_documents_with_chunks:
-            existing_node_ids = set()
-            new_nodes = []
-            
-            for node in doc.nodes:
-                node.type = global_node_types[node.id]
-                if node.id not in existing_node_ids:
-                    new_nodes.append(node)
-                    existing_node_ids.add(node.id)
-                    
-            for rel in doc.relationships:
-                if not getattr(rel, "type", None) or str(rel.type).strip().lower() in ["null", "none", ""]:
-                    rel.type = "RELATED_TO"
-                    
-                rel.source.type = global_node_types[rel.source.id]
-                rel.target.type = global_node_types[rel.target.id]
-                
-                if rel.source.id not in existing_node_ids:
-                    new_nodes.append(rel.source)
-                    existing_node_ids.add(rel.source.id)
-                if rel.target.id not in existing_node_ids:
-                    new_nodes.append(rel.target)
-                    existing_node_ids.add(rel.target.id)
-            
-            doc.nodes = new_nodes
-            valid_graph_documents.append(doc)
-        
-        texts_to_embed = []
-        node_references = []
-        
-        for chunk_text, graph_document in graph_documents_with_chunks:
-            chunk_id = f"Chunk_{hashlib.md5(chunk_text.encode('utf-8')).hexdigest()}"
-            chunk_node = Node(id=chunk_id, type="Chunk", properties={"text": chunk_text})
-            
-            texts_to_embed.append(chunk_text[:1000])
-            node_references.append(chunk_node)
-                
-            original_nodes = list(graph_document.nodes)
-            for node in original_nodes:
-                texts_to_embed.append(node.id)
-                node_references.append(node)
-                
-                rel = Relationship(source=node, target=chunk_node, type="MENTIONED_IN")
-                graph_document.relationships.append(rel)
-                    
-            graph_document.nodes.append(chunk_node)
+        # Validation pipeline (mutates the extracted documents in place, in
+        # this order): consistent node types -> node/relationship sanitation
+        # -> chunk nodes with MENTIONED_IN links for retrieval.
+        global_node_types = build_global_node_types(graph_documents_with_chunks)
+        valid_graph_documents = sanitize_graph_documents(graph_documents_with_chunks, global_node_types)
+        texts_to_embed, node_references = attach_chunk_nodes(graph_documents_with_chunks)
 
         embed_cost = 0.0
         if node_references:
@@ -259,36 +208,7 @@ class SpannerGraphRAGAdapter(BaseRAGAdapter):
                 print(f"Failed batched embeddings: {e}")
 
         if valid_graph_documents:
-            # Consolidate all nodes and relationships into a single GraphDocument
-            # to prevent duplicate DDL schema generation errors in Spanner.
-            global_nodes = {}
-            for doc in valid_graph_documents:
-                for node in doc.nodes:
-                    if node.id not in global_nodes:
-                        global_nodes[node.id] = node
-                    else:
-                        if node.properties:
-                            if not global_nodes[node.id].properties:
-                                global_nodes[node.id].properties = {}
-                            global_nodes[node.id].properties.update(node.properties)
-
-            global_relationships = []
-            seen_relationships = set()
-            for doc in valid_graph_documents:
-                for rel in doc.relationships:
-                    rel.source = global_nodes[rel.source.id]
-                    rel.target = global_nodes[rel.target.id]
-                    
-                    rel_key = (rel.source.id, rel.target.id, rel.type)
-                    if rel_key not in seen_relationships:
-                        seen_relationships.add(rel_key)
-                        global_relationships.append(rel)
-
-            merged_doc = GraphDocument(
-                nodes=list(global_nodes.values()),
-                relationships=global_relationships,
-                source=valid_graph_documents[0].source
-            )
+            merged_doc = merge_graph_documents(valid_graph_documents)
 
             print("Adding documents to graph store...")
             await asyncio.to_thread(self.graph_store.add_graph_documents, graph_documents=[merged_doc])
@@ -296,6 +216,7 @@ class SpannerGraphRAGAdapter(BaseRAGAdapter):
 
         # Total indexing cost = LLM graph extraction (all docs + retries) + node/chunk embeddings.
         return usage_cb.cost() + embed_cost
+
     @retry(wait=wait_exponential(1, max=10), stop=stop_after_attempt(5))
     async def retrieve(self, query: str) -> tuple[list[str], float]:
         query_embeddings, cost = await asyncio.to_thread(

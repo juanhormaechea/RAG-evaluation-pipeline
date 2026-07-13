@@ -43,7 +43,18 @@ override-dependencies = [
     "transformers>=4.46.0,<5.0.0"
 ]
 
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "integration: hits the real litellm gateway; opt in with: dotenvx run -f .env -- .venv/bin/pytest -m integration",
+]
+addopts = "-m 'not integration'"
+
 [dependency-groups]
 dev = [
     "pandas-stubs>=3.0.3.260530",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
 ]
