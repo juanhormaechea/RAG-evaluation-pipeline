@@ -1,10 +1,11 @@
 """LightRAG bindings: model/embedding functions, initialization, context parsing."""
-import json
 from lightrag.llm.openai import openai_complete_if_cache, openai_embed
 from lightrag.utils import EmbeddingFunc
 from lightrag.kg.shared_storage import initialize_pipeline_status
 from lightrag import LightRAG
 from src.config import Config
+from src.utils.documents import dedup_preserve_order
+from typing import Any
 
 
 async def llm_model_func(prompt, system_prompt=None, history_messages=[], **kwargs) -> str:
@@ -45,34 +46,41 @@ async def initialize_lightrag():
     return rag
 
 
-def extract_descriptions_lightrag(raw_context: str) -> list[str]:
-    chunks = []
-    graph_elements = []
+def extract_descriptions_lightrag(raw_context: dict[str, Any]) -> list[str]:
+    if raw_context.get("status") != "success":
+        return []
 
-    for line in raw_context.strip().splitlines():
-        line = line.strip()
-        if not line or line.startswith("```") or any(x in line for x in ["Knowledge Graph Data", "Document Chunks", "Reference Document List"]):
+    data = raw_context.get("data", {})
+    contexts: list[str] = []
+
+    def _source_prefix(file_path: str | None) -> str:
+        if file_path and file_path != "unknown_source":
+            return f"[source: {file_path}] "
+        return ""
+
+    # Document chunks: raw source text, most reliable for faithfulness/attribution.
+    for chunk in data.get("chunks", []):
+        content = (chunk.get("content") or "").strip()
+        if not content:
             continue
-        if line.startswith("{") and line.endswith("}"):
-            try:
-                data = json.loads(line)
-                if "content" in data:
-                    # Text chunk
-                    chunks.append(data["content"])
-                elif "description" in data:
-                    # Entity or relationship description
-                    desc = data["description"].split("<SEP>")[0]
-                    graph_elements.append(desc)
-                else:
-                    graph_elements.append(line)
-            except json.JSONDecodeError:
-                graph_elements.append(line)
-        else:
-            graph_elements.append(line)
+        contexts.append(f"{_source_prefix(chunk.get('file_path'))}{content}")
 
-    # Combine chunks and group the scattered graph metadata into a single string block
-    contexts = list(chunks)
-    if graph_elements:
-        contexts.append("Retrieved Graph Entities and Relationships:\n" + "\n".join(graph_elements))
+    # Relationship descriptions: keep the src->tgt endpoints so the synthesized
+    # fact stays interpretable (dropping them was the old parser's information loss).
+    for rel in data.get("relationships", []):
+        desc = (rel.get("description") or "").strip()
+        if not desc:
+            continue
+        src_id, tgt_id = rel.get("src_id", "?"), rel.get("tgt_id", "?")
+        contexts.append(f"{_source_prefix(rel.get('file_path'))}Relationship ({src_id} - {tgt_id}): {desc}")
 
-    return contexts
+    # Entity descriptions: named, typed graph nodes relevant to the query.
+    for ent in data.get("entities", []):
+        desc = (ent.get("description") or "").strip()
+        if not desc:
+            continue
+        name = ent.get("entity_name", "?")
+        etype = ent.get("entity_type") or "UNKNOWN"
+        contexts.append(f"{_source_prefix(ent.get('file_path'))}Entity {name} ({etype}): {desc}")
+
+    return dedup_preserve_order(contexts)

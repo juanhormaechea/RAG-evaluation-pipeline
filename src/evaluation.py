@@ -1,16 +1,27 @@
 import os
 import asyncio
 import pandas as pd
-import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from typing import Any
 from tenacity import retry, wait_exponential, stop_after_attempt
-from ragas.metrics.collections import ContextPrecision, ContextUtilization, ContextRecall, ContextEntityRecall, NoiseSensitivity, AnswerRelevancy, Faithfulness
-from ragas.llms import llm_factory
 from src.config import Config
 from src.utils.schemas import JudgeGradingScheme
 from src.utils.scoring import calculate_final_score
+
+PREFIX_MAP = {
+    "vector_rag": "vector",
+    "lightrag": "lightrag",
+    "hipporag": "hipporag",
+    "spanner_graph": "graph",
+    "agentic_rag": "agentic"
+}
+
+QUERY_TYPES = [
+        "cross_doc_synthesis", "consistency_check", "multi_doc_entity", 
+        "cross_doc_multi_hop", "global_thematic", "factoid_single_doc", 
+        "unanswerable", "ALL"
+    ]
 
 def add_eval_dataset(df: pd.DataFrame, strategies: list[str]) -> None:
     for strategy in strategies:
@@ -28,17 +39,14 @@ def add_eval_dataset(df: pd.DataFrame, strategies: list[str]) -> None:
 
 
 
-def _initialize_dataframes(strategies: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    scorer_df = pd.read_csv("./templates/CrossDoc_RAG_Scoring_Template_v2.csv")
-    scoring_summary_df = pd.read_csv("./templates/CrossDoc_RAG_Scoring_Summary.csv")
-
-    PREFIX_MAP = {
-        "vector_rag": "vector",
-        "lightrag": "lightrag",
-        "hipporag": "hipporag",
-        "spanner_graph": "graph",
-        "agentic_rag": "agentic"
-    }
+def _initialize_dataframes(strategies: list[str], df_benchmark_data: pd.DataFrame) -> pd.DataFrame:
+    # Build the scorer from the benchmark rows actually being evaluated (not a
+    # re-read of the full CSV) so the positional writes in _run_llm_evaluations
+    # stay aligned when a subset like short_benchmark.csv is in play.
+    base_cols = [c for c in ["query_id", "query_type", "num_docs_required", "query",
+                             "ground_truth", "source_documents", "hypothesis_favors"]
+                 if c in df_benchmark_data.columns]
+    scorer_df = df_benchmark_data[base_cols].copy().reset_index(drop=True)
 
     for strategy in strategies:
         prefix = PREFIX_MAP[strategy]
@@ -46,25 +54,19 @@ def _initialize_dataframes(strategies: list[str]) -> tuple[pd.DataFrame, pd.Data
             col_name = f"{prefix}_{measure}"
             if col_name not in scorer_df.columns:
                 scorer_df[col_name] = pd.Series(dtype="float64")
-    return scorer_df, scoring_summary_df
+    return scorer_df
 
 
 async def _run_llm_evaluations(
     df: pd.DataFrame,
-    retrieval_df: pd.DataFrame,
+    e2e_df: pd.DataFrame,
+    e2e_cost_df: pd.DataFrame,
     gemini_client,
     openai_client,
     strategies: list[str],
     scorer_df: pd.DataFrame,
     is_aggregated: bool
 ) -> tuple[list[Any], list[tuple[str, int, str]]]:
-    PREFIX_MAP = {
-        "vector_rag": "vector",
-        "lightrag": "lightrag",
-        "hipporag": "hipporag",
-        "spanner_graph": "graph",
-        "agentic_rag": "agentic"
-    }
     
     sem = asyncio.Semaphore(10)
 
@@ -89,10 +91,12 @@ async def _run_llm_evaluations(
         prefix = PREFIX_MAP[strategy]
         for i in range(df.shape[0]):
             if is_aggregated:
-                scorer_df.at[i, f"{prefix}_latency_ms"] = retrieval_df.at["retrieval_time", strategy]
+                scorer_df.at[i, f"{prefix}_latency_ms"] = e2e_df.at["retrieval_time", strategy]
             else:
-                scorer_df.at[i, f"{prefix}_latency_ms"] = retrieval_df[strategy].iloc[i] * 1000.0 # type:ignore
+                scorer_df.at[i, f"{prefix}_latency_ms"] = e2e_df[strategy].iloc[i] * 1000.0 # type:ignore
             
+            scorer_df.at[i, f"{prefix}_cost_usd"] = e2e_cost_df[strategy].iloc[i]
+
             strategy_dataset = df.at[i, f"dataset_{strategy}"]
             prompt = Config.USER_PROMPT.format(**strategy_dataset) # type: ignore
             tasks_model_1.append(safe_score(openai_client, prompt, Config.LLM_MODEL_1))
@@ -118,14 +122,6 @@ def _parse_and_store_metrics(
     task_metadata: list[tuple[str, int, str]]
 ) -> pd.DataFrame:
     
-    PREFIX_MAP = {
-        "vector_rag": "vector",
-        "lightrag": "lightrag",
-        "hipporag": "hipporag",
-        "spanner_graph": "graph",
-        "agentic_rag": "agentic"
-    }
-
     metrics = ["correctness", "nugget_recall", "faithful", "retrieval", "attribution"]
 
     df1 = pd.DataFrame([res.output_parsed.model_dump() for res in response_list[0]])
@@ -144,22 +140,19 @@ def _parse_and_store_metrics(
 
 
 def _calculate_final_scores(scorer_df: pd.DataFrame, strategies: list[str]) -> pd.DataFrame:
-    PREFIX_MAP = {
-        "vector_rag": "vector",
-        "lightrag": "lightrag",
-        "hipporag": "hipporag",
-        "spanner_graph": "graph",
-        "agentic_rag": "agentic"
-    }
+
     for strategy in strategies:
         prefix = PREFIX_MAP[strategy]
         scorer_df[f"{prefix}_final_score"] = 0.0
+        scorer_df[f"{prefix}_quality_score"] = 0.0
         for i in range(scorer_df.shape[0]):
             q_type = scorer_df.at[i, "query_type"]
             use_recall = q_type in ["multi_doc_entity", "global_thematic"]
-            
+            faithful = scorer_df.at[i, f"{prefix}_faithful"]
+            primary = scorer_df.at[i, f"{prefix}_nugget_recall"] if use_recall else scorer_df.at[i, f"{prefix}_correctness"]
+
             final_score = calculate_final_score( # type: ignore
-                faithfulness=scorer_df.at[i, f"{prefix}_faithful"], # type:ignore
+                faithfulness=faithful, # type:ignore
                 correctness=None if use_recall else scorer_df.at[i, f"{prefix}_correctness"], # type:ignore
                 nugget_recall=scorer_df.at[i, f"{prefix}_nugget_recall"], # type:ignore
                 retrieval=scorer_df.at[i, f"{prefix}_retrieval"], # type:ignore
@@ -167,105 +160,88 @@ def _calculate_final_scores(scorer_df: pd.DataFrame, strategies: list[str]) -> p
                 unanswerable=(q_type == "unanswerable")
             )
             scorer_df.at[i, f"{prefix}_final_score"] = final_score
+            # Citation-independent fallback: rank on answer quality alone if the
+            # [source:] marker pipeline leaves retrieval/attribution unmeasurable.
+            quality = faithful if q_type == "unanswerable" else 0.5 * faithful + 0.5 * primary # type: ignore
+            scorer_df.at[i, f"{prefix}_quality_score"] = quality
     return scorer_df
 
 
-def _aggregate_summary(scorer_df: pd.DataFrame, scoring_summary_df: pd.DataFrame) -> pd.DataFrame:
-    grouped_means = scorer_df.groupby("query_type").mean(numeric_only=True)
+def _aggregate_summary(scorer_df: pd.DataFrame) -> pd.DataFrame:
+    """Build the per-(query_type, system) summary from scratch.
 
-    for i in range(scoring_summary_df.shape[0]):
-        system = scoring_summary_df.at[i, "system"]
-        q_type = scoring_summary_df.at[i, "query_type"]
-        
-        if system == "vector":
-            score_cols, lat_cols, faith_cols = ["vector_final_score"], ["vector_latency_ms"], ["vector_faithful"]
-        elif system == "agentic":
-            score_cols, lat_cols, faith_cols = ["agentic_final_score"], ["agentic_latency_ms"], ["agentic_faithful"]
-        elif system == "graph":
-            score_cols = ["lightrag_final_score", "hipporag_final_score", "graph_final_score"]
-            lat_cols = ["lightrag_latency_ms", "hipporag_latency_ms", "graph_latency_ms"]
-            faith_cols = ["lightrag_faithful", "hipporag_faithful", "graph_faithful"]
-        else:
-            continue
-            
+    One row per individual system — the spanner adapter is reported as
+    "spanner_graph", never folded into a combined "graph" average with
+    lightrag/hipporag. n_queries comes from the scored rows themselves.
+    """
+    grouped_means = scorer_df.groupby("query_type").mean(numeric_only=True)
+    type_counts = scorer_df["query_type"].value_counts()
+
+    rows = []
+    for q_type in QUERY_TYPES:
         if q_type == "ALL":
-            scoring_summary_df.at[i, "avg_score"] = scorer_df[score_cols].mean().mean()
-            scoring_summary_df.at[i, "avg_latency_ms"] = scorer_df[lat_cols].mean().mean()
-            scoring_summary_df.at[i, "faithfulness_rate"] = scorer_df[faith_cols].mean().mean()
+            stats, n = scorer_df.mean(numeric_only=True), int(scorer_df.shape[0])
+        elif q_type in grouped_means.index:
+            stats, n = grouped_means.loc[q_type], int(type_counts[q_type])
         else:
-            scoring_summary_df.at[i, "avg_score"] = grouped_means.loc[q_type, score_cols].mean() # type: ignore
-            scoring_summary_df.at[i, "avg_latency_ms"] = grouped_means.loc[q_type, lat_cols].mean() # type: ignore
-            scoring_summary_df.at[i, "faithfulness_rate"] = grouped_means.loc[q_type, faith_cols].mean() # type: ignore
-    return scoring_summary_df
+            continue  # type absent from this benchmark run (e.g. smoke tests)
+        for system, prefix in PREFIX_MAP.items():
+            rows.append({
+                "benchmark_set": "cross_doc",
+                "query_type": q_type,
+                "n_queries": n,
+                "system": system,
+                "avg_score": stats[f"{prefix}_final_score"],
+                "quality_score": stats[f"{prefix}_quality_score"],
+                "faithfulness_rate": stats[f"{prefix}_faithful"],
+                "avg_latency_ms": stats[f"{prefix}_latency_ms"],
+                "avg_cost_usd": stats[f"{prefix}_cost_usd"],
+            })
+    return pd.DataFrame(rows)
 
 
-def _generate_visualizations(scorer_df: pd.DataFrame, scoring_summary_df: pd.DataFrame) -> None:
-    grouped_means = scorer_df.groupby("query_type").mean(numeric_only=True)
-    query_types = [
-        "cross_doc_synthesis", "consistency_check", "multi_doc_entity", 
-        "cross_doc_multi_hop", "global_thematic", "factoid_single_doc", 
-        "unanswerable", "ALL"
-    ]
-    
-    fig, axes = plt.subplots(8, 2, figsize=(16, 32))
-    for (ax_main, ax_breakdown), q_type in zip(axes, query_types):
+def _generate_visualizations(scoring_summary_df: pd.DataFrame) -> None:
+    fig, axes = plt.subplots(len(QUERY_TYPES), 1, figsize=(12, 4 * len(QUERY_TYPES)))
+    for ax, q_type in zip(axes, QUERY_TYPES):
         subset = scoring_summary_df[scoring_summary_df["query_type"] == q_type]
-        sns.barplot(data=subset, x="system", y="avg_score", ax=ax_main)
-        ax_main.set_title(q_type.replace("_", " ").title())
-        ax_main.set(xlabel="RAG solutions", ylabel="Score")
-        ax_main.set_ylim(0.0, 1.0)
-
-        if q_type == "ALL":
-            breakdown_data = {
-                "system": ["lightrag", "hipporag", "spanner_graph"],
-                "avg_score": [
-                    scorer_df["lightrag_final_score"].mean(),
-                    scorer_df["hipporag_final_score"].mean(),
-                    scorer_df["graph_final_score"].mean()  
-                ]
-            }
-        else:
-            breakdown_data = {
-                "system": ["lightrag", "hipporag", "spanner_graph"],
-                "avg_score": [
-                    grouped_means.loc[q_type, "lightrag_final_score"],
-                    grouped_means.loc[q_type, "hipporag_final_score"],
-                    grouped_means.loc[q_type, "graph_final_score"] 
-                ]
-            }
-        
-        breakdown_df = pd.DataFrame(breakdown_data)
-        sns.barplot(data=breakdown_df, x="system", y="avg_score", ax=ax_breakdown, palette="Set2")
-        ax_breakdown.set_title(f"{q_type.replace('_', ' ').title()} - Graph breakdown")
-        ax_breakdown.set(xlabel="Graph RAG solutions", ylabel="Score")
-        ax_breakdown.set_ylim(0.0, 1.0)
+        if subset.empty:
+            ax.set_visible(False)
+            continue
+        sns.barplot(data=subset, x="system", y="avg_score", ax=ax)
+        ax.set_title(f"{q_type.replace('_', ' ').title()} (n={int(subset['n_queries'].iloc[0])})")
+        ax.set(xlabel="RAG solutions", ylabel="Score")
+        ax.set_ylim(0.0, 1.0)
 
     plt.tight_layout()
     plt.show()
 
 
-async def evaluate_retrieval(df: pd.DataFrame, retrieval_df: pd.DataFrame, gemini_client, openai_client, strategies: list[str]) -> pd.DataFrame:
-    scorer_df, scoring_summary_df = _initialize_dataframes(strategies)
-    is_aggregated = "retrieval_time" in retrieval_df.index
+async def evaluate_retrieval(df: pd.DataFrame, e2e_df: pd.DataFrame, e2e_cost_df: pd.DataFrame, gemini_client, openai_client, strategies: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    scorer_df = _initialize_dataframes(strategies, df)
+    is_aggregated = "retrieval_time" in e2e_df.index
 
     response_list, task_metadata = await _run_llm_evaluations(
-        df, retrieval_df, gemini_client, openai_client, strategies, scorer_df, is_aggregated
+        df, e2e_df, e2e_cost_df, gemini_client, openai_client, strategies, scorer_df, is_aggregated
     )
 
     scorer_df = _parse_and_store_metrics(scorer_df, response_list, task_metadata)
     scorer_df = _calculate_final_scores(scorer_df, strategies)
-    scoring_summary_df = _aggregate_summary(scorer_df, scoring_summary_df)
+    scoring_summary_df = _aggregate_summary(scorer_df)
 
-    scorer_df.to_csv("./templates/CrossDoc_RAG_Scoring_Template_v2.csv", index=False)
-    scoring_summary_df.to_csv("./templates/CrossDoc_RAG_Scoring_Summary.csv", index=False)
+    os.makedirs("./results", exist_ok=True)
+    scorer_df.to_csv("./results/scores.csv", index=False)
+    scoring_summary_df.to_csv("./results/scoring_summary.csv", index=False)
 
-    _generate_visualizations(scorer_df, scoring_summary_df)
+    _generate_visualizations(scoring_summary_df)
     
     average_latency = {}
+    average_cost = {}
     for strategy in strategies:
         if is_aggregated:
-            average_latency[strategy] = retrieval_df.at["retrieval_time", strategy]
+            average_latency[strategy] = e2e_df.at["retrieval_time", strategy]
         else:
-            average_latency[strategy] = retrieval_df[strategy].mean() * 1000.0
+            average_latency[strategy] = e2e_df[strategy].mean() * 1000.0
+        
+        average_cost[strategy] = e2e_cost_df[strategy].mean()
 
-    return pd.DataFrame(average_latency, index=["retrieval_time"])
+    return pd.DataFrame(average_latency, index=["retrieval_time"]), pd.DataFrame(average_cost, index=["retrieval_cost"])
