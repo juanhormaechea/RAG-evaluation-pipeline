@@ -200,7 +200,7 @@ def _aggregate_summary(scorer_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _generate_visualizations(scoring_summary_df: pd.DataFrame) -> None:
+def _generate_visualizations(scoring_summary_df: pd.DataFrame, results_dir: str = "./results", show: bool = True) -> None:
     fig, axes = plt.subplots(len(QUERY_TYPES), 1, figsize=(12, 4 * len(QUERY_TYPES)))
     for ax, q_type in zip(axes, QUERY_TYPES):
         subset = scoring_summary_df[scoring_summary_df["query_type"] == q_type]
@@ -213,10 +213,17 @@ def _generate_visualizations(scoring_summary_df: pd.DataFrame) -> None:
         ax.set_ylim(0.0, 1.0)
 
     plt.tight_layout()
-    plt.show()
+    # Persist per-run so a multi-strategy loop keeps every figure instead of
+    # clobbering a single inline render.
+    os.makedirs(results_dir, exist_ok=True)
+    fig.savefig(os.path.join(results_dir, "scores.png"), dpi=100, bbox_inches="tight")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)  # batch runs save to disk; don't render or leak figures
 
 
-async def evaluate_retrieval(df: pd.DataFrame, e2e_df: pd.DataFrame, e2e_cost_df: pd.DataFrame, gemini_client, openai_client, strategies: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+async def evaluate_retrieval(df: pd.DataFrame, e2e_df: pd.DataFrame, e2e_cost_df: pd.DataFrame, gemini_client, openai_client, strategies: list[str], results_dir: str = "./results", show: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
     scorer_df = _initialize_dataframes(strategies, df)
     is_aggregated = "retrieval_time" in e2e_df.index
 
@@ -228,11 +235,11 @@ async def evaluate_retrieval(df: pd.DataFrame, e2e_df: pd.DataFrame, e2e_cost_df
     scorer_df = _calculate_final_scores(scorer_df, strategies)
     scoring_summary_df = _aggregate_summary(scorer_df)
 
-    os.makedirs("./results", exist_ok=True)
-    scorer_df.to_csv("./results/scores.csv", index=False)
-    scoring_summary_df.to_csv("./results/scoring_summary.csv", index=False)
+    os.makedirs(results_dir, exist_ok=True)
+    scorer_df.to_csv(os.path.join(results_dir, "scores.csv"), index=False)
+    scoring_summary_df.to_csv(os.path.join(results_dir, "scoring_summary.csv"), index=False)
 
-    _generate_visualizations(scoring_summary_df)
+    _generate_visualizations(scoring_summary_df, results_dir, show)
     
     average_latency = {}
     average_cost = {}

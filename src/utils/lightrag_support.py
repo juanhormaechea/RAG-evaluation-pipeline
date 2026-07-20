@@ -34,9 +34,9 @@ async def embedding_func(texts: list[str]):
     )
 
 
-async def initialize_lightrag():
+async def initialize_lightrag(working_dir: str = Config.WORKING_DIR):
     rag = LightRAG(
-        working_dir=Config.WORKING_DIR,
+        working_dir=working_dir,
         llm_model_func=llm_model_func,
         embedding_func=EmbeddingFunc(embedding_dim=768, func=embedding_func),
         graph_storage="Neo4JStorage"

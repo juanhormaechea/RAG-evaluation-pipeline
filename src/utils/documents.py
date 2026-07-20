@@ -63,3 +63,22 @@ def process_pptx_file(paths: str | list[str]) -> list[str]:
                 context.append(text)
 
     return context
+
+
+def fuse_strings(contents: list[str], min_tokens: int) -> list[str]:
+    sorted_contents = sorted(contents, key=lambda c: len(_ENCODER.encode(c)))
+
+    fused_list: list[str] = []
+    current = ""
+
+    for content in sorted_contents:
+        if len(_ENCODER.encode(current)) > min_tokens:
+            fused_list.append(current)
+            current = content
+        else:
+            current = f"{current} {content}" if current else content
+
+    if current:
+        fused_list.append(current)
+
+    return fused_list

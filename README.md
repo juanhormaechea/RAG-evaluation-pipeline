@@ -37,7 +37,32 @@ The results are compiled into an evaluation dataset, which maps the original que
 
 ### 6. Analysis and Visualization
 
-Finally, the pipeline aggregates the scores and performance data (latency/intervals) to generate comparative visualizations. This enables an intuitive understanding of trade-offs between speed, cost, and answer quality across the evaluated architectures.
+Finally, the pipeline aggregates the scores and performance data (latency/intervals) to generate comparative visualizations. This enables an intuitive understanding of trade-offs between speed, cost, and answer quality across the evaluated architectures. When several chunking strategies are evaluated (see below), their results are further consolidated into a single cross-strategy comparison.
+
+---
+
+## Chunking Strategy Comparison
+
+How a corpus is split into indexed units, that is, **chunk granularity**, strongly affects every RAG method. Fine chunks favour precise, targeted retrieval, while coarser chunks pack more context (and more source documents) into each retrieved unit. To make this trade-off measurable, the harness runs the **entire pipeline** (index → retrieve → generate → evaluate) once per chunking strategy and compares the outcomes side by side.
+
+### Building the strategies
+
+`process_pptx_file` produces fine-grained chunks straight from the documents using docling. This is the **baseline**. From there, `fuse_strings(contents, min_tokens)` sorts the chunks by length and greedily merges the smallest ones together until each fused chunk crosses a token threshold, yielding progressively coarser corpora. Three thresholds give three additional strategies:
+
+| Strategy      | Content list                     | Description                                 |
+| :------------ | :------------------------------- | :------------------------------------------ |
+| `baseline`  | `contents`                     | Raw docling chunks, unmodified (finest).    |
+| `fuse_1000` | `fuse_strings(contents, 1000)` | Small chunks fused to a ~1,000-token floor. |
+| `fuse_2000` | `fuse_strings(contents, 2000)` | Fused to a ~2,000-token floor.              |
+| `fuse_4000` | `fuse_strings(contents, 4000)` | Fused to a ~4,000-token floor (coarsest).   |
+
+### Isolated per-strategy runs
+
+Each strategy is executed by `run_pipeline`, which builds a fresh set of adapters with **their own storage**  `./outputs/{strategy}` for HippoRAG and `./data/rag_storage/{strategy}` for LightRAG and writes its scores to a dedicated `./results/{strategy}/` directory. HippoRAG and LightRAG persist their indexes on disk and would otherwise accumulate chunks from earlier strategies, letting one run's corpus leak into the next and distort the comparison.
+
+### Comparing the results
+
+Once every strategy has run, `compare_runs` collects their summaries into a single **RAG method × chunking strategy** view covering final score, quality score, latency, retrieval + generation cost, and indexing cost. The combined table is saved to `./results/comparison.csv`, with an accompanying grouped bar chart at `./results/comparison.png`.
 
 ---
 
@@ -66,4 +91,3 @@ Based on the benchmark template, specific RAG methodologies are hypothesized to 
 | **Global Thematic**     | Broad queries asking for overarching themes or summaries of the entire corpus.                         | **Graph RAG**           | Graphs can abstract high-level communities and themes using community detection algorithms.                                      |
 | **Cross-Doc Multi-Hop** | Complex queries requiring the system to connect a chain of facts across different documents.           | **Agentic RAG**         | Agents can reason step-by-step, retrieving one fact to inform the search query for the next fact in the chain.                   |
 | **Cross-Doc Synthesis** | Queries requiring the amalgamation of disparate concepts from multiple sources into a cohesive answer. | **Graph / Agentic RAG** | Both methods excel here; graphs provide the structural links, while agents provide the reasoning to synthesize the final answer. |
-
