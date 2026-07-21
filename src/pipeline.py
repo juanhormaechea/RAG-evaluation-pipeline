@@ -3,9 +3,7 @@ import asyncio
 import datetime
 import pandas as pd
 import matplotlib.pyplot as plt
-import openai
 from hipporag import HippoRAG
-from tenacity import retry, wait_exponential, stop_after_attempt, retry_if_exception_type
 from src.config import Config
 from src.rag_adapters import (
     VectorRAGAdapter,
@@ -16,6 +14,14 @@ from src.rag_adapters import (
 )
 from src.utils.benchmark import initialize_dataframe, generate_prompt
 from src.utils.lightrag_support import initialize_lightrag
+from src.utils.retrying import api_retry
+from src.utils.checkpointing import (
+    content_fingerprint,
+    load_index_manifest,
+    save_index_entry,
+    load_completed_run,
+    save_completed_run,
+)
 from src.evaluation import add_eval_dataset, evaluate_retrieval
 
 
@@ -44,8 +50,7 @@ async def build_adapters(clients, label: str) -> dict:
     }
 
 
-@retry(wait=wait_exponential(min=4, max=60), stop=stop_after_attempt(10),
-       retry=retry_if_exception_type(openai.RateLimitError))
+@api_retry
 async def _safe_completion(client, prompt: str):
     return await client.chat.completions.with_raw_response.create(
         model=Config.LLM_MODEL_BASE,
@@ -70,14 +75,32 @@ async def run_pipeline(
     results_root: str = "./results",
 ) -> dict:
 
+    results_dir = os.path.join(results_root, label)
+    content_hash = content_fingerprint(content_list)
+
+    # Resume: a fully-completed strategy is reloaded verbatim -- no adapters
+    # built, no LLM calls -- so its shared stores (Qdrant/Neo4j/Spanner) are
+    # never re-touched. That is what keeps the per-adapter index skip below
+    # sound: the store still holds *this* strategy's data.
+    cached = load_completed_run(results_dir, content_hash)
+    if cached is not None:
+        print(f"=== [{label}] already complete; reusing checkpoint (no re-index/retrieve) ===")
+        return cached
+
     adapters = await build_adapters(clients, label)
     strategies = list(adapters.keys())
     df = initialize_dataframe(benchmark_csv, strategies)
 
-    # --- Indexing ---
+    # --- Indexing (checkpointed per adapter so a crash after indexing resumes cheaply) ---
+    already_indexed = load_index_manifest(results_dir, content_hash)
     indexing_costs = {name: 0.0 for name in strategies}
     for name, adapter in adapters.items():
+        if name in already_indexed:
+            print(f"[{label}] skip indexing {name}: reusing checkpoint.")
+            indexing_costs[name] = already_indexed[name]
+            continue
         indexing_costs[name] = await adapter.index(content_list)
+        save_index_entry(results_dir, content_hash, name, indexing_costs[name])
     # Agentic shares vector_rag's collection (its own index() is a no-op).
     indexing_costs["agentic_rag"] = indexing_costs["vector_rag"]
     indexing_costs_df = pd.DataFrame(indexing_costs, index=["indexing_cost"])
@@ -133,7 +156,6 @@ async def run_pipeline(
     e2e_cost_df = retrieval_cost_df + generation_cost_df
     add_eval_dataset(df, strategies)
 
-    results_dir = os.path.join(results_root, label)
     e2e_latency_df, e2e_cost_summary_df = await evaluate_retrieval(
         df,
         e2e_retrieval_df,
@@ -145,7 +167,7 @@ async def run_pipeline(
         show=False,  # per-strategy figures saved to disk; keep the batch cell quiet
     )
 
-    return {
+    result = {
         "label": label,
         "df": df,
         "indexing_costs_df": indexing_costs_df,
@@ -153,7 +175,12 @@ async def run_pipeline(
         "e2e_cost_df": e2e_cost_summary_df,
         "scoring_summary_df": pd.read_csv(os.path.join(results_dir, "scoring_summary.csv")),
         "scores_df": pd.read_csv(os.path.join(results_dir, "scores.csv")),
+        "content_hash": content_hash,
     }
+    # Written LAST as the completion marker: its presence => this strategy is
+    # fully done and safe to reload on a later resume.
+    save_completed_run(results_dir, result)
+    return result
 
 
 def compare_runs(all_runs: dict[str, dict], results_root: str = "./results") -> pd.DataFrame:

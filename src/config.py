@@ -14,6 +14,7 @@ class Config:
     WORKING_DIR = "./data/rag_storage"
     HIPPODIR = "./outputs"
     QDRANT_STORAGE_DIR = "./data/qdrant_storage"
+    RESULTS_DIR = "./results"
 
     LLM_MODEL_BASE = "gemini-2.5-flash"
     LLM_MODEL_1 = "gpt-5.4-nano-2026-03-17"
@@ -153,3 +154,11 @@ class Config:
         if os.path.exists(cls.QDRANT_STORAGE_DIR):
             shutil.rmtree(cls.QDRANT_STORAGE_DIR)
         os.makedirs(cls.QDRANT_STORAGE_DIR, exist_ok=True)
+
+        # Wipe prior results/checkpoints too: a fresh start must invalidate the
+        # resume checkpoints (index_manifest.json / run_result.pkl) so a stale
+        # marker can never make run_pipeline skip indexing against wiped stores
+        # or reload results for a different corpus.
+        if os.path.exists(cls.RESULTS_DIR):
+            shutil.rmtree(cls.RESULTS_DIR)
+        os.makedirs(cls.RESULTS_DIR, exist_ok=True)

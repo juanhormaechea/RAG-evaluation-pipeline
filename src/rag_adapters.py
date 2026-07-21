@@ -12,6 +12,7 @@ from langchain.chat_models import init_chat_model
 from langgraph.graph import MessagesState, START, END, StateGraph
 from langgraph.prebuilt import ToolNode
 from tenacity import retry, wait_exponential, stop_after_attempt
+from src.utils.retrying import api_retry
 from lightrag import QueryParam
 from src.utils.schemas import GradeDocuments, RewrittenQuestion
 from src.utils.documents import load_documents, normalize_text, dedup_preserve_order, truncate_to_token_budget
@@ -72,7 +73,7 @@ class VectorRAGAdapter(BaseRAGAdapter):
 
         return cost
 
-    @retry(wait=wait_exponential(1, max=10), stop=stop_after_attempt(5))
+    @api_retry
     async def retrieve(self, query: str) -> tuple[list[str], float]:
         context = await asyncio.to_thread(self._sync_retrieve, query)
         return context
@@ -107,7 +108,7 @@ class LightRAGAdapter(BaseRAGAdapter):
         Config.TOKEN_TRACKER.reset() # type: ignore
         return cost
 
-    @retry(wait=wait_exponential(1, max=10), stop=stop_after_attempt(5))
+    @api_retry
     async def retrieve(self, query: str) -> tuple[list[str], float]:
         param = QueryParam(
             mode="mix",
@@ -133,7 +134,7 @@ class HippoRAGAdapter(BaseRAGAdapter):
         await asyncio.to_thread(self.hipporag.index, docs=documents)
         return self.usage_tracker.cost()
 
-    @retry(wait=wait_exponential(1, max=10), stop=stop_after_attempt(5))
+    @api_retry
     async def retrieve(self, query: str) -> tuple[list[str], float]:
         if not self.hipporag.fact_embedding_store.embeddings:
             return [], 0.0
@@ -251,7 +252,7 @@ class SpannerGraphRAGAdapter(BaseRAGAdapter):
         # Total indexing cost = LLM graph extraction (all docs + retries) + node/chunk embeddings.
         return usage_cb.cost() + embed_cost
 
-    @retry(wait=wait_exponential(1, max=10), stop=stop_after_attempt(5))
+    @api_retry
     async def retrieve(self, query: str) -> tuple[list[str], float]:
         query_embeddings, cost = await asyncio.to_thread(
             embed_query_with_cost, self.gemini_client, Config.EMBEDDING_MODEL, query # type: ignore

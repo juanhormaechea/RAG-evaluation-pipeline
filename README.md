@@ -64,6 +64,10 @@ Each strategy is executed by `run_pipeline`, which builds a fresh set of adapter
 
 Once every strategy has run, `compare_runs` collects their summaries into a single **RAG method × chunking strategy** view covering final score, quality score, latency, retrieval + generation cost, and indexing cost. The combined table is saved to `./results/comparison.csv`, with an accompanying grouped bar chart at `./results/comparison.png`.
 
+### Resuming after a crash
+
+If a run fails partway through, simply re-run the pipeline cell — finished strategies are reused and only the unfinished work is redone. Do **not** re-run the setup cell (`Config.setup_directories()`) first: it starts a clean benchmark and discards everything computed so far.
+
 ---
 
 ## Evaluation Metrics
