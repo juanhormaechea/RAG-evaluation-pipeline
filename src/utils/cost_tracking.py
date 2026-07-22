@@ -2,6 +2,8 @@
 import logging
 import threading
 from langchain_core.callbacks import AsyncCallbackHandler
+from src.config import Config
+from src.utils.documents import _ENCODER
 
 
 def calculate_total_cost(usage_data: dict) -> float:
@@ -46,14 +48,46 @@ def embed_query_with_cost(client, model: str, text: str) -> tuple[list[float], f
     return embedding, cost
 
 
-def embed_texts_with_cost(client, model: str, texts: list[str],
-                          batch_size: int = 250) -> tuple[list[list[float]], float]:
-    vectors, total_cost = [], 0.0
-    for i in range(0, len(texts), batch_size):
-        raw = client.embeddings.with_raw_response.create(model=model, input=texts[i:i + batch_size])
+def embed_texts_with_cost(client, model: str, texts: list[str]) -> tuple[list[list[float]], float]:
+    """Embed texts, batching by TOKEN budget rather than a fixed instance count."""
+    per_text = Config.EMBED_MAX_TOKENS_PER_TEXT
+    max_request_tokens = Config.EMBED_MAX_TOKENS_PER_REQUEST
+    MAX_INSTANCES = 250  # Vertex per-request instance cap
+
+    # One encode pass: cap each text to the per-text limit and record its token
+    # count for batching. Capping keeps per_text < 2048 tokens per single input.
+    prepared: list[tuple[str, int]] = []
+    for text in texts:
+        tokens = _ENCODER.encode(text)
+        if per_text is not None and len(tokens) > per_text:
+            tokens = tokens[:per_text]
+            text = _ENCODER.decode(tokens)
+        prepared.append((text, len(tokens)))
+
+    vectors: list[list[float]] = []
+    total_cost = 0.0
+
+    def flush(batch: list[str]) -> None:
+        nonlocal total_cost
+        if not batch:
+            return
+        raw = client.embeddings.with_raw_response.create(model=model, input=batch)
         total_cost += float(raw.headers.get("x-litellm-response-cost") or 0.0)
         # sort by .index to guarantee input order
         vectors.extend(d.embedding for d in sorted(raw.parse().data, key=lambda d: d.index))
+
+    batch: list[str] = []
+    batch_tokens = 0
+    for text, n_tokens in prepared:
+        # Flush before adding when this text would breach either bound; a single
+        # text always goes out on its own rather than being dropped.
+        if batch and (batch_tokens + n_tokens > max_request_tokens or len(batch) >= MAX_INSTANCES):
+            flush(batch)
+            batch, batch_tokens = [], 0
+        batch.append(text)
+        batch_tokens += n_tokens
+    flush(batch)
+
     return vectors, total_cost
 
 

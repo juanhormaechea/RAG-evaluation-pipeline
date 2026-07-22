@@ -34,6 +34,12 @@ class Config:
     # Shared retrieval budget so every adapter is judged on equal context volume.
     MAX_CONTEXT_TOKENS = 3000
 
+    # Embedding request limits for text-embedding-004 (Vertex, via the litellm
+    # gateway): it rejects any request over ~20000 input tokens in total and any
+    # single text over ~2048 tokens.
+    EMBED_MAX_TOKENS_PER_TEXT = 1800
+    EMBED_MAX_TOKENS_PER_REQUEST = 18000 # Leave margin for the discrepancy between tiktoken and the embedding model tokenizer used
+
     RAG_SYSTEM_PROMPT = """
     You are an expert retrieval agent.
     Your goal is to decide whether to answer directly or to use the 'retrieve_context' tool to gather factual information to aid your answer.

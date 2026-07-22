@@ -20,8 +20,8 @@ and forces a clean rebuild.
 """
 import os
 import json
+import pickle
 import hashlib
-import pandas as pd
 
 _MANIFEST = "index_manifest.json"
 _RESULT = "run_result.pkl"
@@ -64,7 +64,8 @@ def load_completed_run(results_dir: str, content_hash: str) -> dict | None:
     path = os.path.join(results_dir, _RESULT)
     if not os.path.exists(path):
         return None
-    result = pd.read_pickle(path)
+    with open(path, "rb") as f:
+        result = pickle.load(f)
     if result.get("content_hash") != content_hash:
         return None  # stale corpus
     return result
@@ -73,7 +74,8 @@ def load_completed_run(results_dir: str, content_hash: str) -> dict | None:
 def save_completed_run(results_dir: str, result: dict) -> None:
     os.makedirs(results_dir, exist_ok=True)
     tmp = os.path.join(results_dir, _RESULT + ".tmp")
-    pd.to_pickle(result, tmp)
+    with open(tmp, "wb") as f:
+        pickle.dump(result, f)
     os.replace(tmp, os.path.join(results_dir, _RESULT))
     # Manifest is now redundant; drop it so bookkeeping stays clean.
     manifest = os.path.join(results_dir, _MANIFEST)

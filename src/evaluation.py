@@ -40,9 +40,6 @@ def add_eval_dataset(df: pd.DataFrame, strategies: list[str]) -> None:
 
 
 def _initialize_dataframes(strategies: list[str], df_benchmark_data: pd.DataFrame) -> pd.DataFrame:
-    # Build the scorer from the benchmark rows actually being evaluated (not a
-    # re-read of the full CSV) so the positional writes in _run_llm_evaluations
-    # stay aligned when a subset like short_benchmark.csv is in play.
     base_cols = [c for c in ["query_id", "query_type", "num_docs_required", "query",
                              "ground_truth", "source_documents", "hypothesis_favors"]
                  if c in df_benchmark_data.columns]
@@ -168,12 +165,6 @@ def _calculate_final_scores(scorer_df: pd.DataFrame, strategies: list[str]) -> p
 
 
 def _aggregate_summary(scorer_df: pd.DataFrame) -> pd.DataFrame:
-    """Build the per-(query_type, system) summary from scratch.
-
-    One row per individual system — the spanner adapter is reported as
-    "spanner_graph", never folded into a combined "graph" average with
-    lightrag/hipporag. n_queries comes from the scored rows themselves.
-    """
     grouped_means = scorer_df.groupby("query_type").mean(numeric_only=True)
     type_counts = scorer_df["query_type"].value_counts()
 
@@ -182,7 +173,7 @@ def _aggregate_summary(scorer_df: pd.DataFrame) -> pd.DataFrame:
         if q_type == "ALL":
             stats, n = scorer_df.mean(numeric_only=True), int(scorer_df.shape[0])
         elif q_type in grouped_means.index:
-            stats, n = grouped_means.loc[q_type], int(type_counts[q_type])
+            stats, n = grouped_means.loc[q_type], int(type_counts[q_type]) 
         else:
             continue  # type absent from this benchmark run (e.g. smoke tests)
         for system, prefix in PREFIX_MAP.items():
